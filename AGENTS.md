@@ -155,7 +155,11 @@ device what it runs, so asking has to be possible without a debugger.
   rather than after a tag has been pushed and can no longer be moved. `-race` is
   a **separate Linux job**, not part of the matrix: it requires cgo, and the rest
   of the pipeline is kept runnable with no C compiler anywhere — the same
-  constraint that put bbolt in the index instead of SQLite.
+  constraint that put bbolt in the index instead of SQLite. That job skips
+  `internal/relay`: go-nostr's write-pump assigns `r.Connection = nil` unlocked
+  while `Relay.close()` reads the same field under a mutex, so `Close()` trips the
+  detector by construction. The bug is upstream and no usage pattern here avoids
+  it; re-check the exclusion whenever go-nostr is upgraded.
 - **The installers download releases**, verify them against `checksums.txt`, and
   only build from source when no release matches the platform. `checksums.txt` is
   therefore part of the published contract — renaming it breaks every installer
