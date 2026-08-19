@@ -1,0 +1,89 @@
+# GoReleaser builds every published Tendrils artifact. Run `goreleaser check` to
+# validate, `goreleaser release --snapshot --clean` to dry-run locally.
+#
+# Both binaries take the same version stamp from the tag, so `tendrils version`
+# and `blossomd --version` on one machine always agree about which release is
+# deployed. That matters: the wire format has changed once in a way the losing
+# device could not detect on its own (see "Two clocks" in AGENTS.md).
+version: 2
+
+project_name: tendrils
+
+before:
+  hooks:
+    - go mod tidy
+    - go test ./...
+
+builds:
+  - id: tendrils
+    binary: tendrils
+    main: ./cmd/tendrils
+    env: [CGO_ENABLED=0] # pure Go by design — no C compiler anywhere in the pipeline
+    flags: [-trimpath]
+    ldflags: &ldflags
+      - -s -w
+      - -X ca.punkscience.tendrils/internal/buildinfo.version={{.Version}}
+      - -X ca.punkscience.tendrils/internal/buildinfo.commit={{.FullCommit}}
+      - -X ca.punkscience.tendrils/internal/buildinfo.date={{.CommitDate}}
+    goos: [linux, windows, darwin]
+    goarch: [amd64, arm64]
+
+  - id: blossomd
+    binary: blossomd
+    main: ./cmd/blossomd
+    env: [CGO_ENABLED=0]
+    flags: [-trimpath]
+    ldflags: *ldflags
+    goos: [linux, windows, darwin]
+    goarch: [amd64, arm64]
+
+archives:
+  # One archive per platform holding both binaries: a machine that runs the
+  # daemon can also host the blob server, and the reference deployment does.
+  - id: tendrils
+    ids: [tendrils, blossomd]
+    name_template: "tendrils_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - README.md
+      - docs/*
+
+checksum:
+  # The installers verify against this file, so its name is part of the contract.
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  use: github
+  sort: asc
+  groups:
+    - title: Fixes
+      regexp: '(?i)^fix'
+      order: 1
+    - title: New
+      regexp: '(?i)^(new|feat)'
+      order: 0
+    - title: Other
+      order: 99
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+      - Merge pull request
+
+release:
+  draft: false
+  prerelease: auto # a -rc/-beta tag publishes as a prerelease automatically
+  footer: |
+    ## Install
+
+    Linux / macOS:  `curl -fsSL https://raw.githubusercontent.com/punkscience/tendrils/main/install.sh | sh`
+    Windows:        `irm https://raw.githubusercontent.com/punkscience/tendrils/main/install.ps1 | iex`
+
+    Upgrade every device together when a release says the wire format changed.

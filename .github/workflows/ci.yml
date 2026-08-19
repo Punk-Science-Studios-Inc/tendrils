@@ -1,0 +1,100 @@
+# Build, vet and test on every push and pull request.
+#
+# Windows is in the matrix on purpose, not for completeness: this project has
+# already shipped two Windows-only defects (a build over a running executable, a
+# test suite assuming POSIX file semantics), and neither was visible on Linux.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt is the project standard; these files need it:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go mod tidy is clean
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - run: go vet ./...
+
+      - run: go build ./...
+
+      # No -race here: it requires cgo, and this project is pure Go precisely so
+      # that no build or test needs a C compiler. The race job below is separate
+      # for that reason.
+      - run: go test ./...
+
+  # The daemon is concurrent (status server, progress callbacks, GC workers), so
+  # the race detector earns its keep — but it needs cgo, which the rest of the
+  # project deliberately does without. Isolated here so the matrix above stays
+  # exactly what a developer can run locally with no C compiler.
+  race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - run: go test -race ./...
+        env:
+          CGO_ENABLED: 1
+
+  # Catch a broken .goreleaser.yaml here rather than on a tag, where the tag is
+  # already pushed and the fix needs a new one.
+  release-dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: build --snapshot --clean --single-target
+
+      - name: version is stamped
+        run: |
+          bin=$(find dist -name tendrils -type f | head -1)
+          "$bin" version
+          "$bin" version | grep -qv '^tendrils dev' \
+            || { echo "release build did not stamp a version"; exit 1; }

@@ -8,6 +8,8 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+
+	"ca.punkscience.tendrils/internal/buildinfo"
 )
 
 func main() {
@@ -22,6 +24,7 @@ func newRootCmd() *cobra.Command {
 		Use:           "tendrils",
 		Short:         "Deliberate folder sync over Nostr + Blossom",
 		Long:          "Tendrils keeps your personal folders identical across your devices by editing locally and syncing deliberately over Nostr + Blossom.",
+		Version:       buildinfo.Get().String(),
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
@@ -33,6 +36,7 @@ func newRootCmd() *cobra.Command {
 		newGCCmd(),
 		newRepairCmd(),
 		newRetryCmd(),
+		newVersionCmd(),
 	)
 	return root
 }

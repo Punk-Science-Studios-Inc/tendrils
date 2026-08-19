@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"ca.punkscience.tendrils/internal/blob"
+	"ca.punkscience.tendrils/internal/buildinfo"
 	"ca.punkscience.tendrils/internal/config"
 	"ca.punkscience.tendrils/internal/engine"
 	"ca.punkscience.tendrils/internal/index"
@@ -95,6 +96,7 @@ func newDaemonCmd() *cobra.Command {
 			npub, _ := id.Npub()
 			out := cmd.OutOrStdout()
 			fmt.Fprintln(out, "Tendrils daemon starting:")
+			fmt.Fprintln(out, "  Version:  ", buildinfo.Get())
 			fmt.Fprintln(out, "  Identity: ", npub)
 			fmt.Fprintln(out, "  Sync root:", cfg.SyncRoot)
 			fmt.Fprintln(out, "  Relays:   ", cfg.Relays)

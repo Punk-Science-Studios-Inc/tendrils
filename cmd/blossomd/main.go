@@ -48,6 +48,8 @@ import (
 
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/nbd-wtf/go-nostr/nip19"
+
+	"ca.punkscience.tendrils/internal/buildinfo"
 )
 
 // authKind is the BUD-01 authorization event kind the Tendrils blob client signs.
@@ -58,6 +60,14 @@ const authKind = 24242
 const emptySHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 func main() {
+	// The only argument this server takes. Everything else is environment, so
+	// there is no flag set to hang it off, but a deployed server still has to be
+	// able to say what it is running.
+	if len(os.Args) > 1 && (os.Args[1] == "version" || os.Args[1] == "-version" || os.Args[1] == "--version") {
+		fmt.Print(buildinfo.Get().Detail("blossomd"))
+		return
+	}
+
 	dir := envOr("BLOSSOM_DIR", "./blobs")
 	addr := envOr("BLOSSOM_ADDR", "127.0.0.1:8091")
 	allowed, err := parseAllowed(os.Getenv("BLOSSOM_ALLOWED_PUBKEYS"))
@@ -195,9 +205,9 @@ func main() {
 	})
 
 	if len(allowed) == 0 {
-		log.Printf("blossomd listening on %s, dir=%s (AUTH OFF — open server, keep off the public internet)", addr, dir)
+		log.Printf("blossomd %s listening on %s, dir=%s (AUTH OFF — open server, keep off the public internet)", buildinfo.Get(), addr, dir)
 	} else {
-		log.Printf("blossomd listening on %s, dir=%s (auth on, %d allowed key(s), get=%s)", addr, dir, len(allowed), getAccess)
+		log.Printf("blossomd %s listening on %s, dir=%s (auth on, %d allowed key(s), get=%s)", buildinfo.Get(), addr, dir, len(allowed), getAccess)
 	}
 	log.Fatal(http.ListenAndServe(addr, nil))
 }

@@ -30,7 +30,8 @@ Built and tested (`go test ./...` green):
 | `internal/relay` | Concrete `engine.EventStore`: publishes/fetches file-entry events over go-nostr websockets to one or more relays. Persistent, lazily-reconnecting connections; publish to all (succeed if any accepts), fetch unions + dedupes by event ID. `Fetch` **paginates** with a NIP-01 `until` cursor (500/page, cursor forced strictly downward so a page of identical timestamps cannot loop) because relays cap one REQ — the reference relay at `relay.towerofsong.ca` is `UseEventstore(db, 400)`. Also `FetchServerList` for Blossom discovery (kind-10063). Tested against a minimal in-process NIP-01 relay (`coder/websocket`) that enforces the same 400 cap, so an unpaginated regression fails the suite. |
 | `internal/serverlist` | Blossom server **discovery**: `Entry`-free codec for the BUD-03 kind-10063 "User Server List" (sign/parse a `[]string` of server URLs under the owner's key). `Shareable` strips loopback/unspecified hosts (never advertise `127.0.0.1` to the whole identity); `Merge` unions lists so devices republish instead of clobbering. The daemon publishes the union when it has a server and discovers from it when it doesn't — so a later device enrolls with just `--key`/`--relay`. |
 | `internal/gc` | Orphan blob reclamation: folds the relay's current truth into a keep-set, classifies every stored blob (kept / unreferenced / invalid / too-recent / not-ours), and deletes only what it can justify. Dry-run by default. See "Blob GC" below — it is the one operation syncing cannot undo. |
-| `cmd/tendrils` | **cobra** CLI: `keygen`, `enroll` (`--key`/`--root`, reuses stored key), `status` (pending/conflicts/**stuck** from scan-vs-index), `daemon` (builds the engine from config and runs a periodic reconcile loop; `--interval`, graceful shutdown on Ctrl-C), `gc` (reclaim orphaned blobs; `--apply` to delete). |
+| `internal/buildinfo` | Which build is running. Release builds stamp version/commit/date via `-ldflags -X`; everything else falls back to the toolchain's embedded module and VCS data, so a source build still reports a real commit and a dirty flag. Both binaries take the same stamp. |
+| `cmd/tendrils` | **cobra** CLI: `keygen`, `enroll` (`--key`/`--root`, reuses stored key), `status` (pending/conflicts/**stuck** from scan-vs-index), `daemon` (builds the engine from config and runs a periodic reconcile loop; `--interval`, graceful shutdown on Ctrl-C), `gc` (reclaim orphaned blobs; `--apply` to delete), `version`. Root sets `cobra.Command.Version`, so `--version`/`-v` work too. |
 
 Not yet built (next milestones): **relay** discovery (NIP-65/kind-10002 — until then `daemon` still requires `--relay` set at enroll; Blossom-server discovery via kind-10063 **is** built, so `--blossom` is optional on later devices), fsnotify watch (with debounce/settle, to complement the periodic reconcile), Blossom multi-server mirroring (daemon uses the first server — which is also why a file too large for that one server simply cannot sync, however many are configured), and the tray. (Blossom **orphan GC** is now built — see "Blob GC" below.)
 
@@ -121,6 +122,44 @@ Every file event carries two timestamps and they answer different questions. Con
 The tradeoff accepted here is the standard deterministic-encryption one: an observer with access to the Blossom server can tell that two blobs hold identical plaintext. The nonce is keyed, so that equality never spans identities. `crypt.Open` reads the nonce from the blob, so blobs sealed by the earlier random-nonce build still decrypt — no migration, but they also do not dedup against newly sealed copies; clearing those orphans is a separate GC job (not built).
 
 Dependencies: `github.com/nbd-wtf/go-nostr`, `go.etcd.io/bbolt`, `github.com/spf13/cobra`.
+
+## Versioning and releases
+
+`tendrils version`, `tendrils --version`, `blossomd --version`. Every binary can
+say what it is, and the daemon prints it in its startup banner.
+
+That is not politeness. The `created_at` change (see "Two clocks" above) is
+invisible to the device that loses: its publishes are dropped by the relay and it
+is never told. The only way to diagnose a fleet that has drifted is to ask each
+device what it runs, so asking has to be possible without a debugger.
+
+- **Version resolution** lives in `internal/buildinfo`. A release build wins,
+  stamped by `-ldflags -X ca.punkscience.tendrils/internal/buildinfo.{version,commit,date}`.
+  Failing that, the module version the toolchain embeds is used — but *only* if it
+  names a real tag. A synthesized pseudo-version (`0.0.0-20260728020249-a81f7ab00a90`)
+  is rejected, because reporting one as a release makes an unreleased build look
+  like a shipped one. What is left is `dev`, plus the VCS commit and dirty flag
+  the toolchain embeds automatically.
+- **Both binaries take the same stamp.** `tendrils` and `blossomd` from one
+  release always agree about the version, so "what is this host running" has one
+  answer, not two.
+- **Cutting a release** is `git tag -a vX.Y.Z && git push origin vX.Y.Z`.
+  `.goreleaser.yaml` builds linux/darwin/windows × amd64/arm64, archives both
+  binaries with the docs, writes `checksums.txt`, and publishes the GitHub
+  Release. `-rc`/`-beta` tags publish as prereleases automatically.
+- **CI** (`.github/workflows/ci.yml`) runs build, vet, `gofmt -l`, `go mod tidy`
+  cleanliness and `go test` on **Linux and Windows** — Windows is in the
+  matrix because this project has already shipped two Windows-only defects that
+  were invisible on Linux. It also runs a GoReleaser snapshot build and asserts
+  the version was stamped, so a broken release config fails on a pull request
+  rather than after a tag has been pushed and can no longer be moved. `-race` is
+  a **separate Linux job**, not part of the matrix: it requires cgo, and the rest
+  of the pipeline is kept runnable with no C compiler anywhere — the same
+  constraint that put bbolt in the index instead of SQLite.
+- **The installers download releases**, verify them against `checksums.txt`, and
+  only build from source when no release matches the platform. `checksums.txt` is
+  therefore part of the published contract — renaming it breaks every installer
+  in the field.
 
 ## Commands
 

@@ -3,3 +3,6 @@
 # Normalize Go and text sources to LF in the repository.
 *.go text eol=lf
 *.md text eol=lf
+# CI and release config, likewise.
+*.yml text eol=lf
+*.yaml text eol=lf

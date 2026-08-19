@@ -14,7 +14,11 @@ Tendrils keeps a folder identical across your machines. It uses a Nostr relay to
 
 ## Install
 
-Requires **Go 1.26+** and **git** (the installer builds from source).
+Prebuilt binaries for Linux, macOS and Windows (amd64 and arm64). The installer
+downloads the latest release, verifies it against the release's `checksums.txt`,
+and installs `tendrils` plus the optional `blossomd` blob server. No toolchain
+required — it falls back to building from source (Go 1.26+ and git) only when
+there is no release for your platform.
 
 **Linux / macOS**
 ```sh
@@ -26,8 +30,18 @@ curl -fsSL https://raw.githubusercontent.com/punkscience/tendrils/main/install.s
 irm https://raw.githubusercontent.com/punkscience/tendrils/main/install.ps1 | iex
 ```
 
+Set `TENDRILS_VERSION=v0.1.0` to pin a release, `TENDRILS_BIN_DIR` to change
+where it lands. Check what you have with:
+
+```sh
+tendrils version     # full build identity — version, commit, build date, Go version
+tendrils --version   # one line
+```
+
 Upgrading an existing fleet — including the one-time repair steps after this
-release — is documented in **[docs/UPGRADING.md](docs/UPGRADING.md)**.
+release — is documented in **[docs/UPGRADING.md](docs/UPGRADING.md)**. Report the
+output of `tendrils version` from each device when a fleet disagrees: a wire
+format change has already once been silent on the losing device.
 
 Or build it yourself:
 ```sh
@@ -62,7 +76,7 @@ Tendrils is transport-agnostic. You bring a relay and a Blossom server.
 > **The one rule that makes multi-device sync work: every device must reach the *same* Blossom server.** The relay only carries the tiny "what changed" events (paths and hashes); the file *bytes* live on Blossom. If each device points at its own local Blossom, the metadata will sync and it will *look* like it's working, but a second device can never fetch the bytes — it's asking an empty server for hashes that live somewhere else. Pick one Blossom server all your devices can reach (a box on your LAN, a small VPS, a tunnelled home server, or a public one) and point every device at it. After the first device is running, later devices can **discover** that server automatically (see below) and be enrolled with just `--key` and `--relay`.
 
 - **Nostr relay** — any relay your key can publish to. Public relays (e.g. `wss://nos.lol`) work, but note that event *paths* (not contents) are visible to the relay operator, so a private/self-hosted relay is recommended for privacy. Many relays enforce a write allowlist — add your key's pubkey there.
-- **Blossom server** — stores the encrypted blobs. Use a public Blossom server, or self-host the minimal reference server included here:
+- **Blossom server** — stores the encrypted blobs. Use a public Blossom server, or self-host the minimal reference server included here (the installer already puts `blossomd` beside `tendrils`; to build it yourself:)
 
   ```sh
   go build -o blossomd ./cmd/blossomd
@@ -112,7 +126,7 @@ Because encryption uses a random nonce per blob, the same file seals to differen
 
 Setting this up for a user, non-interactively:
 
-1. **Install**: run the platform installer above (needs Go 1.26+ and git on PATH). Binary lands in `~/.local/bin/tendrils` (Linux/macOS) or `%LOCALAPPDATA%\Programs\tendrils\tendrils.exe` (Windows). Override the target dir with `TENDRILS_BIN_DIR`.
+1. **Install**: run the platform installer above (downloads a checksum-verified release; no toolchain needed). Binaries land in `~/.local/bin/tendrils` (Linux/macOS) or `%LOCALAPPDATA%\Programs\tendrils\tendrils.exe` (Windows). Override the target dir with `TENDRILS_BIN_DIR`.
 2. **Transport**: ensure a relay and **one shared Blossom server that every device can reach** are up. A per-device *localhost* Blossom does **not** work for multi-device sync — the second device would fetch blobs from its own empty server. Run one `blossomd` on a host all devices can reach (bind `0.0.0.0`; if it's public, set `BLOSSOM_ALLOWED_PUBKEYS` to the user's pubkey) and point every device at that same URL.
 3. **Enroll each device with the same key**: `tendrils enroll --key <nsec> --root <folder> --relay <wss/ws url> --blossom <http url>`. `--key` may be omitted after the first enroll (the key is stored `0600` in the state dir). `--blossom` may be omitted on **later** devices: once the first device has run its daemon, the Blossom server is discovered from the relay.
 4. **Run continuously**: `tendrils daemon --interval 1m`. Register it as a service so it survives reboot — e.g. a `systemd --user` unit on Linux, or a Startup-folder launcher on Windows.
@@ -132,6 +146,34 @@ Everything is flag- and env-driven; there are no interactive prompts.
 go build ./...        # build all
 go test ./...         # run tests
 go vet ./...          # static checks
+gofmt -l -w .         # format (gofmt is the project standard)
+```
+
+CI runs build, vet, `gofmt -l`, `go mod tidy` cleanliness and `go test` on Linux
+and Windows for every push and pull request, plus a GoReleaser dry run so a broken
+release config fails before a tag exists rather than after. The race detector runs
+in a separate Linux job — it needs cgo, and everything above is deliberately
+buildable with no C compiler.
+
+## Releasing
+
+Releases are cut from an annotated tag; GoReleaser does the rest.
+
+```sh
+git tag -a v0.1.0 -m "v0.1.0"
+git push origin v0.1.0
+```
+
+That builds `tendrils` and `blossomd` for linux/darwin/windows × amd64/arm64,
+stamps the tag, commit and commit date into both binaries, writes `checksums.txt`,
+and publishes a GitHub Release the installers download from. A tag with a
+prerelease suffix (`v0.2.0-rc1`) publishes as a prerelease automatically.
+
+Dry-run the whole thing without tagging or publishing:
+
+```sh
+goreleaser check
+goreleaser release --snapshot --clean --skip=publish
 ```
 
 ## License
