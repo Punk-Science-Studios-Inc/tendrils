@@ -22,12 +22,12 @@ there is no release for your platform.
 
 **Linux / macOS**
 ```sh
-curl -fsSL https://raw.githubusercontent.com/punkscience/tendrils/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Punk-Science-Studios-Inc/tendrils/main/install.sh | sh
 ```
 
 **Windows (PowerShell)**
 ```powershell
-irm https://raw.githubusercontent.com/punkscience/tendrils/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/Punk-Science-Studios-Inc/tendrils/main/install.ps1 | iex
 ```
 
 Set `TENDRILS_VERSION=v0.1.0` to pin a release, `TENDRILS_BIN_DIR` to change
@@ -45,7 +45,7 @@ format change has already once been silent on the losing device.
 
 Or build it yourself:
 ```sh
-git clone https://github.com/punkscience/tendrils && cd tendrils
+git clone https://github.com/Punk-Science-Studios-Inc/tendrils && cd tendrils
 go build -o tendrils ./cmd/tendrils
 ```
 

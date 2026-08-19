@@ -83,7 +83,7 @@ release:
   footer: |
     ## Install
 
-    Linux / macOS:  `curl -fsSL https://raw.githubusercontent.com/punkscience/tendrils/main/install.sh | sh`
-    Windows:        `irm https://raw.githubusercontent.com/punkscience/tendrils/main/install.ps1 | iex`
+    Linux / macOS:  `curl -fsSL https://raw.githubusercontent.com/Punk-Science-Studios-Inc/tendrils/main/install.sh | sh`
+    Windows:        `irm https://raw.githubusercontent.com/Punk-Science-Studios-Inc/tendrils/main/install.ps1 | iex`
 
     Upgrade every device together when a release says the wire format changed.

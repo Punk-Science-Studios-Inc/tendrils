@@ -1,7 +1,7 @@
 #!/bin/sh
 # Tendrils installer for Linux and macOS.
 #
-#   curl -fsSL https://raw.githubusercontent.com/punkscience/tendrils/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/Punk-Science-Studios-Inc/tendrils/main/install.sh | sh
 #
 # Downloads the latest release, verifies it against the release's checksums.txt,
 # and installs tendrils + blossomd. No toolchain required.
@@ -13,7 +13,7 @@
 #      TENDRILS_VERSION  install a specific tag, e.g. v0.1.0 (default: latest)
 set -eu
 
-SLUG="punkscience/tendrils"
+SLUG="Punk-Science-Studios-Inc/tendrils"
 REPO="https://github.com/$SLUG.git"
 BIN="tendrils"
 DEST="${TENDRILS_BIN_DIR:-$HOME/.local/bin}"
@@ -132,5 +132,5 @@ Tendrils installed. Next steps:
 
 You need a Nostr relay and a Blossom server (run the bundled 'blossomd' to
 self-host one). Enroll every device with the SAME key to sync them.
-See https://github.com/punkscience/tendrils for details.
+See https://github.com/Punk-Science-Studios-Inc/tendrils for details.
 EOF

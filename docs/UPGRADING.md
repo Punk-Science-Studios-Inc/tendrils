@@ -108,14 +108,14 @@ journalctl --user -u tendrils-blossom.service -n 2 --no-pager
 **Linux / macOS**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/punkscience/tendrils/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Punk-Science-Studios-Inc/tendrils/main/install.sh | sh
 systemctl --user restart tendrils-daemon.service
 ```
 
 **Windows (PowerShell)**
 
 ```powershell
-irm https://raw.githubusercontent.com/punkscience/tendrils/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/Punk-Science-Studios-Inc/tendrils/main/install.ps1 | iex
 ```
 
 Then restart the daemon however it is registered — see the `install-windows`

@@ -1,6 +1,6 @@
 # Tendrils installer for Windows.
 #
-#   irm https://raw.githubusercontent.com/punkscience/tendrils/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/Punk-Science-Studios-Inc/tendrils/main/install.ps1 | iex
 #
 # Downloads the latest release, verifies it against the release's checksums.txt,
 # and installs tendrils.exe + blossomd.exe. No toolchain required.
@@ -13,7 +13,7 @@
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$slug = 'punkscience/tendrils'
+$slug = 'Punk-Science-Studios-Inc/tendrils'
 $repo = "https://github.com/$slug.git"
 
 function Info($m) { Write-Host "==> $m" -ForegroundColor Cyan }
@@ -123,4 +123,4 @@ Write-Host "  1. tendrils keygen                            # create your master
 Write-Host "  2. tendrils enroll --key <nsec> --root <folder> --relay wss://<relay> --blossom http://<blossom>:8091"
 Write-Host "  3. tendrils daemon --interval 1m              # start syncing"
 Write-Host ""
-Write-Host "Enroll every device with the SAME key. See https://github.com/punkscience/tendrils"
+Write-Host "Enroll every device with the SAME key. See https://github.com/Punk-Science-Studios-Inc/tendrils"
