@@ -31,6 +31,14 @@ type testRelay struct {
 	// relay's UseEventstore(db, 400). A client that does not paginate silently
 	// sees only this many, which is the bug this cap exists to catch.
 	maxLimit int
+
+	// The ways a relay stops answering without saying so. Each of these used to
+	// reach the engine as "this key has published nothing", because go-nostr's
+	// QuerySync reports its own timeout, a CLOSED, and a dead socket all as an
+	// empty result with no error.
+	silent      bool   // send the events but never EOSE
+	closeReason string // answer a REQ with CLOSED instead of events
+	dieAfterREQ int    // hang up after this many REQs on a connection (-1: on the first)
 }
 
 func newTestRelay(t *testing.T) (url string, r *testRelay) {
@@ -49,6 +57,7 @@ func newTestRelay(t *testing.T) (url string, r *testRelay) {
 func (tr *testRelay) serve(conn *websocket.Conn) {
 	ctx := context.Background()
 	defer conn.Close(websocket.StatusNormalClosure, "")
+	reqs := 0
 	for {
 		_, data, err := conn.Read(ctx)
 		if err != nil {
@@ -71,6 +80,15 @@ func (tr *testRelay) serve(conn *websocket.Conn) {
 		case "REQ":
 			var subID string
 			json.Unmarshal(msg[1], &subID)
+			reqs++
+			if tr.closeReason != "" {
+				writeJSON(ctx, conn, []any{"CLOSED", subID, tr.closeReason})
+				continue
+			}
+			if tr.dieAfterREQ != 0 && reqs > tr.dieAfterREQ {
+				conn.Close(websocket.StatusAbnormalClosure, "")
+				return
+			}
 			for i := 2; i < len(msg); i++ {
 				var f nostr.Filter
 				if err := json.Unmarshal(msg[i], &f); err != nil {
@@ -79,6 +97,9 @@ func (tr *testRelay) serve(conn *websocket.Conn) {
 				for _, e := range tr.match(f) {
 					writeJSON(ctx, conn, []any{"EVENT", subID, e})
 				}
+			}
+			if tr.silent {
+				continue // events delivered, end-of-stored-events never sent
 			}
 			writeJSON(ctx, conn, []any{"EOSE", subID})
 		case "CLOSE":
@@ -201,9 +222,12 @@ func TestPublishThenFetch(t *testing.T) {
 		t.Fatalf("publish: %v", err)
 	}
 
-	got, err := c.Fetch(ctx, id.PublicHex())
+	got, complete, err := c.Fetch(ctx, id.PublicHex())
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
+	}
+	if !complete {
+		t.Error("a relay that answered in full should report a complete set")
 	}
 	if len(got) != 1 {
 		t.Fatalf("fetched %d events, want 1", len(got))
@@ -229,9 +253,12 @@ func TestReplacePreservesLatest(t *testing.T) {
 	c.Publish(ctx, signEntry(t, id, &tree.Entry{Path: "a.md", Sha256: "old", ModTime: time.Unix(1_700_000_000, 0)}))
 	c.Publish(ctx, signEntry(t, id, &tree.Entry{Path: "a.md", Sha256: "new", ModTime: time.Unix(1_700_000_500, 0)}))
 
-	got, err := c.Fetch(ctx, id.PublicHex())
+	got, complete, err := c.Fetch(ctx, id.PublicHex())
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !complete {
+		t.Error("a relay that answered in full should report a complete set")
 	}
 	if len(got) != 1 {
 		t.Fatalf("fetched %d events, want 1 (replaceable)", len(got))
@@ -261,42 +288,167 @@ func TestFetchPaginatesPastRelayLimit(t *testing.T) {
 
 	c := New([]string{url})
 	defer c.Close()
-	got, err := c.Fetch(context.Background(), id.PublicHex())
+	got, complete, err := c.Fetch(context.Background(), id.PublicHex())
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
+	}
+	if !complete {
+		t.Error("a relay that answered in full should report a complete set")
 	}
 	if len(got) != total {
 		t.Fatalf("fetched %d events, want all %d (relay caps one REQ at %d)", len(got), total, r.maxLimit)
 	}
 }
 
-// Pagination must terminate even when every event shares one created_at, which
-// leaves the `until` cursor with nowhere to advance on its own.
-func TestFetchTerminatesOnIdenticalTimestamps(t *testing.T) {
+// A publish storm can put more events into one second than a relay will return
+// in one page. Pagination must still terminate — the `until` cursor has nowhere
+// to go, so it is forced downward — and it must report the result incomplete,
+// because forcing it steps over every event at that second past the relay's cap.
+//
+// This is the shape the reference relay is actually in: a long spread history
+// (which is what proves the relay caps a page at 400) with dense seconds buried
+// in it. Reporting that walk as complete is what let the engine conclude those
+// paths were never published and republish them, and republishing is what made
+// the dense seconds in the first place.
+func TestFetchReportsIncompleteOnIdenticalTimestamps(t *testing.T) {
 	url, r := newTestRelay(t)
 	id := mustID(t)
-	const total = 600 // more than one page, all at the same instant
+	const (
+		spread = 900 // one per second: enough to prove the relay's per-page cap
+		pile   = 600 // more than one page, all at a single instant below them
+	)
+	const base = 1_700_000_000
 
-	for i := 0; i < total; i++ {
+	for i := 0; i < spread; i++ {
 		r.save(signEntryAt(t, id, &tree.Entry{
-			Path:    fmt.Sprintf("f%04d.md", i),
+			Path:    fmt.Sprintf("spread%04d.md", i),
 			Sha256:  fmt.Sprintf("h%04d", i),
-			ModTime: time.Unix(1_700_000_000, 0),
-		}, 1_700_000_000))
+			ModTime: time.Unix(base, 0),
+		}, base+1+int64(i)))
+	}
+	for i := 0; i < pile; i++ {
+		r.save(signEntryAt(t, id, &tree.Entry{
+			Path:    fmt.Sprintf("pile%04d.md", i),
+			Sha256:  fmt.Sprintf("p%04d", i),
+			ModTime: time.Unix(base, 0),
+		}, base))
 	}
 
 	c := New([]string{url})
 	defer c.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	got, err := c.Fetch(ctx, id.PublicHex())
+	got, complete, err := c.Fetch(ctx, id.PublicHex())
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
-	// The relay can only ever surface maxLimit of a single-timestamp pile, so the
-	// point here is that Fetch returns rather than spinning.
 	if len(got) == 0 {
 		t.Fatal("fetched nothing")
+	}
+	if len(got) >= spread+pile {
+		t.Fatalf("fetched %d of %d; this test needs the relay's cap to bite", len(got), spread+pile)
+	}
+	if complete {
+		t.Error("a walk that stepped over events at the boundary timestamp reported itself complete")
+	}
+}
+
+// The failure this whole file exists for: a relay that goes quiet must not be
+// read as a relay with nothing to say.
+//
+// go-nostr's QuerySync returns (whatever arrived, nil) when its deadline expires,
+// when the relay CLOSEs the subscription, and when the websocket dies. All three
+// arrive at the engine as "no events for this key", and the engine's response to
+// no events is to publish the entire tree. On the reference fleet that produced a
+// 5,048-path republish in a single 33-minute pass — every file re-announced, and
+// on a relay that cannot replace long paths, every one of those events kept
+// forever.
+//
+// Each subtest is one of those three, and every one must be an error rather than
+// an empty answer.
+func TestFetchFailsRatherThanReportingASilentRelayAsEmpty(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(*testRelay)
+		want  string
+	}{
+		{
+			name:  "events but no end-of-stored-events",
+			setup: func(r *testRelay) { r.silent = true },
+			want:  "end-of-stored-events",
+		},
+		{
+			name:  "subscription closed by the relay",
+			setup: func(r *testRelay) { r.closeReason = "auth-required: we only serve authenticated users" },
+			want:  "closed the subscription",
+		},
+		{
+			name:  "connection dropped without answering",
+			setup: func(r *testRelay) { r.dieAfterREQ = -1 },
+			want:  "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			url, r := newTestRelay(t)
+			id := mustID(t)
+			for i := 0; i < 3; i++ {
+				r.save(signEntryAt(t, id, &tree.Entry{
+					Path:    fmt.Sprintf("f%d.md", i),
+					Sha256:  fmt.Sprintf("h%d", i),
+					ModTime: time.Unix(1_700_000_000, 0),
+				}, 1_700_000_000+int64(i)))
+			}
+			tc.setup(r)
+
+			c := New([]string{url})
+			defer c.Close()
+			c.pageTimeout = 300 * time.Millisecond
+			c.pageRetryDelay = 0
+
+			got, complete, err := c.Fetch(context.Background(), id.PublicHex())
+			if err == nil {
+				t.Fatalf("fetch returned %d events and complete=%v; a relay that never finished answering must be an error", len(got), complete)
+			}
+			if tc.want != "" && !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q does not mention %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// A connection that drops part-way through a walk is retried, not written off.
+// A fetch of a large tree is hundreds of pages long; failing the pass on the
+// first hiccup would stall a big tree permanently, and the point of the stricter
+// pagination is to stop guessing, not to stop syncing. Every event must still be
+// there afterwards.
+func TestFetchRetriesAPageAndStillReturnsEverything(t *testing.T) {
+	url, r := newTestRelay(t)
+	id := mustID(t)
+	const total = 950 // three pages at the 400 cap
+	for i := 0; i < total; i++ {
+		r.save(signEntryAt(t, id, &tree.Entry{
+			Path:    fmt.Sprintf("f%04d.md", i),
+			Sha256:  fmt.Sprintf("h%04d", i),
+			ModTime: time.Unix(1_700_000_000, 0),
+		}, 1_700_000_000+int64(i)))
+	}
+	r.dieAfterREQ = 1 // every connection answers one page, then hangs up
+
+	c := New([]string{url})
+	defer c.Close()
+	c.pageTimeout = 5 * time.Second
+	c.pageRetryDelay = 0
+
+	got, complete, err := c.Fetch(context.Background(), id.PublicHex())
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if len(got) != total {
+		t.Fatalf("fetched %d events, want all %d despite the dropped connections", len(got), total)
+	}
+	if !complete {
+		t.Error("a walk that recovered and reached the end should report a complete set")
 	}
 }
 
@@ -313,9 +465,12 @@ func TestFetchDedupesAcrossRelays(t *testing.T) {
 
 	c := New([]string{url1, url2})
 	defer c.Close()
-	got, err := c.Fetch(ctx, id.PublicHex())
+	got, complete, err := c.Fetch(ctx, id.PublicHex())
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !complete {
+		t.Error("two relays that both answered in full should report a complete set")
 	}
 	if len(got) != 1 {
 		t.Errorf("fetched %d events, want 1 after dedup", len(got))

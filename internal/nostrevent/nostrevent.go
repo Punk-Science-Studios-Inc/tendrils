@@ -50,6 +50,31 @@ import (
 // only the latest event per (pubkey, kind, d=path).
 const KindFileEntry = 31337
 
+// MaxIndexedTagValue is the longest `d` value a relay can be relied on to index,
+// and therefore the longest path whose events a relay will actually replace.
+//
+// NIP-01 sets no limit, but real relays do. The reference relay here (khatru over
+// fiatjaf's eventstore) silently declines to index a tag value longer than 100
+// bytes: a `#d` filter for such a path returns nothing even when the relay is
+// holding hundreds of matching events, so the replaceable-event lookup that would
+// retire the previous version finds nothing to retire and every publish is kept
+// forever. On the reference fleet that is 1,103 of 5,188 paths, and 109,000 of
+// the relay's 114,747 events.
+//
+// This is why the fold in engine.FoldRemote is not optional and why it applies
+// NIP-01's created_at rule itself: for a long path the client has to do the
+// arbitration the relay could not.
+//
+// Fixing it at the source means putting something bounded in the `d` tag — a hash
+// of the path, with the path itself in a separate tag — and that is a wire-format
+// change no device can make unilaterally: an old build reads the `d` tag as the
+// path and would create files named after hashes. See AGENTS.md.
+const MaxIndexedTagValue = 100
+
+// PathTooLongForRelay reports whether a path exceeds what a relay will index as a
+// d tag, so its events will pile up unreplaced rather than superseding each other.
+func PathTooLongForRelay(path string) bool { return len(path) > MaxIndexedTagValue }
+
 // Build constructs an unsigned event from an entry.
 func Build(e *tree.Entry) (*nostr.Event, error) {
 	if e == nil || e.Path == "" {

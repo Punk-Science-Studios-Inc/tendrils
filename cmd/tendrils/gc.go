@@ -172,9 +172,18 @@ func newGCCmd() *cobra.Command {
 // exists to reclaim. engine.FoldRemote applies the same winner-per-path rule the
 // sync engine does, so "live" here means what a syncing device would actually pull.
 func liveBlobsFromRelay(ctx context.Context, relays *relay.Client, pubkey string) (live map[string]struct{}, events, paths int, err error) {
-	evts, err := relays.Fetch(ctx, pubkey)
+	evts, complete, err := relays.Fetch(ctx, pubkey)
 	if err != nil {
 		return nil, 0, 0, err
+	}
+	// Deleting a blob is the one thing syncing again cannot undo, so a keep-set
+	// built from an answer the relay did not finish giving is not usable at any
+	// price. Refuse rather than guess: every event we failed to read is a file
+	// whose blobs would look like orphans.
+	if !complete {
+		return nil, 0, 0, fmt.Errorf("the relay did not return its whole event set, so the keep-set would be missing files this sweep would then delete. " +
+			"If this persists, the relay is holding more events at one timestamp than it will return in one query (NIP-01 pagination cannot reach past that) — " +
+			"prune the superseded events from the relay and try again")
 	}
 	current, skipped := engine.FoldRemote(evts)
 	if len(skipped) > 0 {

@@ -8,6 +8,153 @@ Read the ordering section before starting. Nothing here is destructive except
 
 ---
 
+## The short version
+
+On a device that already has Tendrils installed:
+
+```sh
+tendrils upgrade                 # verify and replace both binaries
+systemctl --user restart tendrils-daemon.service
+```
+
+`tendrils upgrade` downloads the release archive for this platform, verifies it
+against the release's `checksums.txt`, **runs the new binary and asks it its
+version**, and only then moves it into place. A failed upgrade leaves the
+working binary exactly where it was. `blossomd` is replaced too, but only if it
+already sits beside `tendrils`.
+
+The rest of this document is the manual route (still the way to bootstrap a new
+machine or recover a broken one), the ordering rules for a whole fleet, and the
+one-time repair steps for damage earlier defects left behind. **`tendrils
+upgrade` does not run any of those repair steps.**
+
+> Nothing has been published yet. Until the first release exists,
+> `tendrils upgrade` reports *"No releases have been published … yet"* and exits
+> zero — it is a state, not a failure — and installing means the `install.sh`
+> route below or a build from source.
+
+---
+
+## Update checks
+
+A background check asks GitHub at most once a day whether a newer release
+exists, caches the answer in `update.json` in the state directory, and prints a
+short notice on **stderr** the next time you run a command:
+
+```
+$ tendrils status
+Identity:  npub1…
+Pending changes: 0
+Conflicts:       0
+
+A new version is available: 0.4.0 (you have 0.3.1)
+Run 'tendrils upgrade' to install it.
+```
+
+The properties that matter:
+
+- **It never delays a command.** The check runs in a detached child process and
+  writes a cache file; the *next* invocation reads it. No command ever waits on
+  the network to print its output.
+- **Offline is silent.** A failed check is cached as a failure and retried on a
+  growing delay (15 minutes doubling to a 6-hour ceiling). A laptop offline for
+  a week neither hammers the API nor prints a network error from a command that
+  has nothing to do with the network. The wait is bounded, so a device that
+  comes back after a month notices the release that day.
+- **It is off in one step.** `TENDRILS_NO_UPDATE_CHECK=1` in the environment, or
+  `"update_check": false` in `config.json`. Both are consulted before anything
+  is scheduled: no cache read, no process spawned, no packet.
+- **The daemon reports; it never upgrades.** It prints the notice in its startup
+  banner beside the version, re-checks daily while running, and logs what it
+  finds. Replacing the binary under a live daemon takes effect on the next
+  start, restart is service-manager-specific, and a sync daemon that restarts
+  itself mid-pass is a new failure mode for no benefit.
+
+Why a folder-sync tool ships an update checker at all: **a device on a stale
+build cannot always tell that it is broken.** The `created_at` change of
+2026-07-23 is the worked example — a pre-change device had every event it
+published silently dropped by the relay, and nothing on that device could say
+so. Auditing a fleet by hand across Linux, Windows and a Pi is how that gets
+found today; a notice turns it into the stale device speaking up.
+
+### Flags
+
+| Flag | Does |
+|---|---|
+| `--check` | Report only. Exits **1** when an upgrade is available, 0 when current, 0 when nothing is published. For scripts and monitoring. |
+| `--version vX.Y.Z` | Install that exact release, including an older one. A downgrade is confirmed first — it is a rollback, and it should be deliberate. |
+| `--yes` | Assume yes for the routine confirmations. **Not** enough for a wire-format boundary. |
+| `--force` | Cross a declared wire-format boundary, or reinstall the version already running (to repair a damaged binary). |
+
+### What it verifies, and what it refuses
+
+An unverified binary is worse than a stale one, so each of these is a refusal
+rather than a warning:
+
+- the release publishes no archive for this OS/architecture;
+- the release publishes no `checksums.txt`;
+- `checksums.txt` does not list this archive (**a missing entry is a refusal** —
+  it is the shape a substitution takes);
+- the downloaded bytes do not match the listed hash;
+- the transfer ended short of the size the release declared;
+- the downloaded binary does not run, or does not report the version it was
+  published as.
+
+Nothing is moved until every binary in the upgrade has passed. A host left with
+a new `tendrils` and an old `blossomd` is worse than one left alone.
+
+### How the replacement happens
+
+Download into a staging directory **inside the destination**, fsync, then
+rename — the same discipline as `blossomd`'s `storeStream` and the engine's
+atomic writes. A rename either happens or it does not.
+
+- **Linux / macOS** — `rename(2)` over a running binary is fine; the running
+  process keeps its inode and is undisturbed.
+- **Windows** — a running image cannot be overwritten or deleted, but it *can*
+  be renamed. The installed binary is renamed to `tendrils.exe.old`, the new one
+  is put in its place, and the `.old` file is swept up on a later run — the
+  first one where the old process is no longer holding it. Seeing a `.old` file
+  next to your binary after an upgrade is expected; it disappears on its own.
+
+If the move fails after the aside, the aside is undone: the previous binary is
+back before the error is printed.
+
+### Restarting
+
+`upgrade` prints the right line for the platform and stops there:
+
+```sh
+systemctl --user restart tendrils-daemon.service     # Linux (systemd user unit)
+```
+```powershell
+schtasks /End /TN "Tendrils Daemon"                  # Windows scheduled task
+schtasks /Run /TN "Tendrils Daemon"
+```
+
+If `blossomd` was replaced, restart the blob server too — and per the ordering
+rules below, on a host running both, restart the blob server first.
+
+### Coordinated upgrades
+
+Some releases require **every device to move together**; upgrading one device
+across that boundary manufactures exactly the split-brain the boundary warns
+about, and the losing side is silent about it.
+
+Each release publishes a `release.json` asset carrying a `wire_format` integer
+and a `min_compatible` version. When a release declares a wire format this build
+does not speak — or declares a `min_compatible` newer than this build —
+`upgrade` says so and refuses to continue without an explicit confirmation, or
+`--force` in a non-interactive run. `--yes` deliberately does not satisfy it:
+`--yes` means "do not ask me the routine questions", and this is not routine.
+
+A release that declares no wire format is not a boundary (nothing before the
+marker existed changed it). A release whose marker exists but cannot be parsed
+**is** treated as a boundary — the one file whose job is to say when a change is
+dangerous is not a file to guess about.
+
+---
+
 ## What changed, and why it matters operationally
 
 Four defects in earlier builds could corrupt or strand data. All are fixed, but
@@ -106,6 +253,13 @@ journalctl --user -u tendrils-blossom.service -n 2 --no-pager
 ## 2. Upgrade each device
 
 **Linux / macOS**
+
+```sh
+tendrils upgrade                                     # on a device that already has it
+systemctl --user restart tendrils-daemon.service
+```
+
+or, to bootstrap a machine that does not:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Punk-Science-Studios-Inc/tendrils/main/install.sh | sh

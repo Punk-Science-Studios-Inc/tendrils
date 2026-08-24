@@ -26,12 +26,13 @@ Built and tested (`go test ./...` green):
 | `internal/config` | State dir (`$TENDRILS_HOME` or OS config dir), local `config.json` (overrides discovery), device key at rest (0600 file — deliberately not a keychain). |
 | `internal/blob` | Blossom (BUD-01/02) client: `Upload`/`Download`/`Has` opaque bytes addressed by sha256, with a signed per-request kind-24242 auth event. Verifies content addresses locally on both directions. Pure transport — no knowledge of encryption or plaintext hashes. A 413 is typed as **`ErrTooLarge`** so the engine can tell "retrying cannot fix this" from a transient failure; error bodies are collapsed and truncated, and a proxy's HTML error page is dropped entirely (quoting one per rejected file is what made the daemon log unreadable). |
 | `internal/tree` `internal/nostrevent` | `Entry` carries `BlobHash` (sealed-blob Blossom address) alongside `Sha256` (plaintext identity); the event codec round-trips it in a `blob` tag. |
-| `internal/engine` | Orchestrates one full `Sync` reconcile pass: scan → read index base → fetch relay truth → `reconcile.Decide` per path → execute (seal+upload+publish / pull+unseal+atomic-write / trash / publish-tombstone). Network deps are `EventStore`/`BlobStore` interfaces (`*blob.Client` satisfies `BlobStore`), so it runs headless. Tested end-to-end with in-memory fakes: publish, pull, two-device convergence, delete propagation to trash, and conflict-copy preservation. One `Sync` is also the bootstrap and the periodic reconcile. **`publishLocal` hashes the bytes it actually read and uploaded**, never the scan's — see "Publish the hash you uploaded" below. Per-path **retry backoff** (`backoff.go`) holds repeatedly-failing paths back instead of retrying them every pass. |
-| `internal/relay` | Concrete `engine.EventStore`: publishes/fetches file-entry events over go-nostr websockets to one or more relays. Persistent, lazily-reconnecting connections; publish to all (succeed if any accepts), fetch unions + dedupes by event ID. `Fetch` **paginates** with a NIP-01 `until` cursor (500/page, cursor forced strictly downward so a page of identical timestamps cannot loop) because relays cap one REQ — the reference relay at `relay.towerofsong.ca` is `UseEventstore(db, 400)`. Also `FetchServerList` for Blossom discovery (kind-10063). Tested against a minimal in-process NIP-01 relay (`coder/websocket`) that enforces the same 400 cap, so an unpaginated regression fails the suite. |
+| `internal/engine` | Orchestrates one full `Sync` reconcile pass: scan → read index base → fetch relay truth → `reconcile.Decide` per path → execute (seal+upload+publish / pull+unseal+atomic-write / trash / publish-tombstone). Network deps are `EventStore`/`BlobStore` interfaces (`*blob.Client` satisfies `BlobStore`), so it runs headless. Tested end-to-end with in-memory fakes: publish, pull, two-device convergence, delete propagation to trash, and conflict-copy preservation. One `Sync` is also the bootstrap and the periodic reconcile. **`publishLocal` hashes the bytes it actually read and uploaded**, never the scan's — see "Publish the hash you uploaded" below. Per-path **retry backoff** (`backoff.go`) holds repeatedly-failing paths back instead of retrying them every pass. A pass acts on the relay's *absence* of a path only when the fetch reported itself complete (`withheldByPartialView`), and `FoldRemote` collapses retained replaceable events by **`created_at`**, the relay's own rule — see "A read that failed is not an empty set" below. |
+| `internal/relay` | Concrete `engine.EventStore`: publishes/fetches file-entry events over go-nostr websockets to one or more relays. Persistent, lazily-reconnecting connections; publish to all (succeed if any accepts), fetch unions + dedupes by event ID. `Fetch` **paginates** with a NIP-01 `until` cursor (500/page) because relays cap one REQ — the reference relay at `relay.towerofsong.ca` is `UseEventstore(db, 400)`. Every page is **proven complete by EOSE**, never by go-nostr's `QuerySync`, which reports a timeout, a `CLOSED` and a dead socket alike as an empty, error-free result; a page that cannot be read is retried and then fails the fetch. `Fetch` returns a **completeness flag** alongside the events — see "A read that failed is not an empty set" below. Also `FetchServerList` for Blossom discovery (kind-10063), under the same rule. Tested against a minimal in-process NIP-01 relay (`coder/websocket`) that enforces the same 400 cap and can go silent, close a subscription, or hang up mid-walk on demand. |
 | `internal/serverlist` | Blossom server **discovery**: `Entry`-free codec for the BUD-03 kind-10063 "User Server List" (sign/parse a `[]string` of server URLs under the owner's key). `Shareable` strips loopback/unspecified hosts (never advertise `127.0.0.1` to the whole identity); `Merge` unions lists so devices republish instead of clobbering. The daemon publishes the union when it has a server and discovers from it when it doesn't — so a later device enrolls with just `--key`/`--relay`. |
 | `internal/gc` | Orphan blob reclamation: folds the relay's current truth into a keep-set, classifies every stored blob (kept / unreferenced / invalid / too-recent / not-ours), and deletes only what it can justify. Dry-run by default. See "Blob GC" below — it is the one operation syncing cannot undo. |
 | `internal/buildinfo` | Which build is running. Release builds stamp version/commit/date via `-ldflags -X`; everything else falls back to the toolchain's embedded module and VCS data, so a source build still reports a real commit and a dirty flag. Both binaries take the same stamp. |
-| `cmd/tendrils` | **cobra** CLI: `keygen`, `enroll` (`--key`/`--root`, reuses stored key), `status` (pending/conflicts/**stuck** from scan-vs-index), `daemon` (builds the engine from config and runs a periodic reconcile loop; `--interval`, graceful shutdown on Ctrl-C), `gc` (reclaim orphaned blobs; `--apply` to delete), `version`. Root sets `cobra.Command.Version`, so `--version`/`-v` work too. |
+| `internal/selfupdate` | Finding, verifying and installing a newer release. Queries the public GitHub releases API (endpoint is a field, so tests drive it from an `httptest.Server`), compares semver, streams the archive to a staging dir **inside the destination**, verifies it against the release's `checksums.txt`, **execs the new binary and checks the version it reports**, then renames it into place. Caches the check in `update.json` (24 h; failures back off 15 m → 6 h). Also `Boundary`, the coordinated-upgrade gate fed by the release's `release.json`. No token, no credentials, no cgo. |
+| `cmd/tendrils` | **cobra** CLI: `keygen`, `enroll` (`--key`/`--root`, reuses stored key), `status` (pending/conflicts/**stuck** from scan-vs-index), `daemon` (builds the engine from config and runs a periodic reconcile loop; `--interval`, graceful shutdown on Ctrl-C), `gc` (reclaim orphaned blobs; `--apply` to delete), `upgrade` (`--check`/`--version`/`--force`/`--yes`), `version`. Root sets `cobra.Command.Version`, so `--version`/`-v` work too, and its `PersistentPostRun` prints the cached update notice and schedules the next background check. |
 
 Not yet built (next milestones): **relay** discovery (NIP-65/kind-10002 — until then `daemon` still requires `--relay` set at enroll; Blossom-server discovery via kind-10063 **is** built, so `--blossom` is optional on later devices), fsnotify watch (with debounce/settle, to complement the periodic reconcile), Blossom multi-server mirroring (daemon uses the first server — which is also why a file too large for that one server simply cannot sync, however many are configured), and the tray. (Blossom **orphan GC** is now built — see "Blob GC" below.)
 
@@ -63,6 +64,118 @@ Three fixes, and all three matter:
 - **blossomd reports a 0-byte blob as 404** unless the address really is the empty hash, so pre-existing corruption stops lying immediately rather than waiting for a sweep.
 
 The general rule: **never let "it exists" stand in for "it is correct" when the consequence of being wrong is silent and permanent.**
+
+## A read that failed is not an empty set
+
+The relay is asked one question per pass — "what has this key published?" — and
+the answer decides whether the engine has anything to say. `reconcile` publishes
+a file precisely when the folded remote set has no entry for it, so **a truncated
+answer that passes itself off as complete makes a device republish its entire
+tree**.
+
+That is exactly what happened. `go-nostr`'s `QuerySync` returns
+`(whatever arrived, nil)` in three different failures: its own undocumented
+7-second deadline, a relay-sent `CLOSED` (auth-required, rate-limited), and the
+websocket dying underneath it. `fetchAll` read a zero-event page as "walked past
+the oldest event" and returned success. One dropped connection therefore looked
+identical to a key that had never published anything, and the next pass re-sealed,
+re-uploaded and re-announced every file in the tree.
+
+Measured on the reference fleet before the fix: **114,747 events for a 5,188-path
+tree**, and a single pass on 2026-08-23 that republished **5,048 paths in 33
+minutes** — 3,973 of those paths' surviving events all sit inside that one burst.
+It is self-amplifying: more events means more pages per fetch, more pages means
+more chances to hit a page that never completes.
+
+Three rules now hold it:
+
+- **A page is EOSE or it is not an answer.** `queryPageOnce` subscribes and
+  collects until end-of-stored-events. A `CLOSED`, a lost connection, a deadline
+  or the events channel closing early is an error however many events had already
+  arrived. Pages are retried (a fetch is hundreds of pages; one hiccup must not
+  stall a big tree) and then the fetch fails loudly.
+- **`Fetch` reports completeness, and callers must handle it.** Its signature is
+  `([]*nostr.Event, bool, error)` so nobody can quietly ignore the difference
+  between "no such path" and "no answer". `gc` refuses to sweep against an
+  incomplete view; `repair` says so and carries on (it only ever uploads).
+- **The engine acts on absence only when absence is a fact.** Under an incomplete
+  view, a path whose index base already records a successful publish of exactly
+  this content is left alone — the relay's silence about it is not evidence. A new
+  or locally-changed file is still published, because that publish carries
+  information the set does not have. Nothing is abandoned: the path is judged
+  afresh the first pass that reads the relay in full.
+
+Two smaller holes in the same seam, closed with it:
+
+- **The cursor still has to be forced past a dense second.** `until` is inclusive,
+  so a page whose events all share one `created_at` cannot advance it; forcing it
+  down guarantees termination but steps over anything at that second beyond the
+  relay's per-REQ cap (the reference relay has three such seconds, left by publish
+  storms). That walk now reports itself incomplete instead of pretending the
+  skipped second was empty — but only once the relay has *proven* it truncates a
+  page, since the last page of every ordinary walk also fails to advance. Claiming
+  incompleteness on every fetch would be just as bad in the other direction: an
+  engine that never trusts a complete view can never repair a relay that really did
+  lose an event.
+- **A publish that never landed also reported success.** go-nostr's `Publish`
+  returns `nil` when the connection dies before the relay's `OK`, so the index
+  would record a file as published that the relay never received. `relay.Publish`
+  now checks whether the connection survived the call.
+
+Note what an incomplete view can and cannot do. Every destructive action —
+`OpWriteRemote`, `OpDeleteLocal` — requires a remote entry the fetch actually
+saw, so a partial view can never trash a file or overwrite one. The only thing it
+could ever cause was a storm of redundant publishes, and the only thing it can
+cause now is a deferred one.
+
+The same rule applies to the kind-10063 Blossom server list: a failed read used
+to look like an empty list, and the daemon publishes the *union* of the discovered
+list and its own servers — so one bad read would have dropped every server this
+device did not happen to have configured. A failed discovery now leaves the
+published list alone.
+
+## The relay only indexes 100 bytes of a `d` tag
+
+The amplifier behind that event count, and a genuine limit of the transport
+rather than a bug in the loop above.
+
+NIP-01 puts no ceiling on a tag value; real relays do. The reference relay
+(khatru over fiatjaf's eventstore) **silently declines to index a tag value longer
+than 100 bytes**. Confirmed directly: a `#d` filter for a 103-byte path returns
+`0` results while the relay is holding 253 events with exactly that `d` tag.
+Since replacing a parameterized-replaceable event means looking up the previous
+one by `(kind, pubkey, d)`, replacement never fires for those paths and **every
+publish is kept forever**.
+
+The split in the field data is total and has no exceptions: every one of the
+4,085 paths at or under 100 bytes has exactly one event on the relay; all 1,103
+paths at 101 bytes or more have many, up to 306. A deep music tree hits this
+constantly.
+
+Two consequences the client has to live with:
+
+- **`engine.FoldRemote` folds by `created_at`, not by the `mtime` tag.** For a
+  long path the client is doing the arbitration the relay could not, and the
+  relay's rule is NIP-01's: greatest `created_at` per `(pubkey, kind, d)`, ties to
+  the lexically smallest id. Folding by mtime got two things wrong — restoring an
+  older version of a file was silently undone (the superseded event describing the
+  newer version still won), and republished-but-identical events, which tie on
+  both mtime and content hash, resolved to whichever event the fetch happened to
+  return first. That last one is the dangerous half: the blob collector folds with
+  this same function, and two folds of one event set in different orders could
+  name different blob addresses.
+- **The daemon warns when it publishes a path it knows the relay cannot replace**
+  (`nostrevent.PathTooLongForRelay`), only on passes that actually publish one.
+
+**Fixing it at the source is a coordinated upgrade and is deliberately not done
+here.** It means putting something bounded in `d` — `sha256(path)` — and carrying
+the real path in its own tag. An old build reads `d` as the path, so it would
+write files named after hashes into the tree, and the two builds would see
+disjoint namespaces and each republish everything. If it is ever done: ship a
+release that *reads* both forms first, wait for the fleet, and only then switch
+what it writes. The ~110k superseded events already on the relay cannot be cleaned
+up with NIP-09 either — a deletion request is matched by the same broken index —
+so they need dropping relay-side.
 
 ## Memory is bounded by bytes, not by count
 
@@ -164,6 +277,95 @@ device what it runs, so asking has to be possible without a debugger.
   only build from source when no release matches the platform. `checksums.txt` is
   therefore part of the published contract — renaming it breaks every installer
   in the field.
+
+## Self-update: the stale device has to be the one that speaks
+
+`internal/selfupdate`, `cmd/tendrils/upgrade.go`, `cmd/tendrils/update.go`,
+`docs/UPGRADING.md`.
+
+Versioning above says the only way to diagnose a drifted fleet is to ask each
+device what it runs. Asking is a manual per-device chore across Linux, Windows
+and a Pi, and the device that most needs asking is the one whose publishes are
+being silently dropped. So the device asks on its own behalf and says the answer
+out loud.
+
+- **A check never delays a command, and never fails one.** It runs as a detached
+  child (`tendrils update-check`, hidden) that writes `update.json`; the *next*
+  invocation reads the cache. A goroutine cannot do this job — `tendrils status`
+  exits in three milliseconds, long before any HTTP round trip.
+- **The lease is written before the child is launched.** A child that dies
+  without reporting back (killed with its shell, out of disk) must not leave a
+  state where every subsequent command launches another one. Claim, then spawn.
+- **Never re-execute a test binary.** Under `go test`, `os.Executable()` is the
+  compiled suite; launching it with an unrecognised argument runs every test
+  again, and each of those would launch another. `reExecutable()` refuses a
+  `.test` binary and anything under the temp dir, and there is a test asserting
+  it. This is a fork bomb, not a nuisance.
+- **Three states, not two.** "A newer release exists", "there is nothing newer",
+  and **"nothing has ever been published"** are distinct, and `ErrNoReleases`
+  keeps the third from collapsing into either. It is the state the repository is
+  in right now, so it is the first path that runs in the field: reported as "up
+  to date" it would be a lie that hides the whole feature, and reported as an
+  error it would make a fresh install look broken. A 404 from the listing
+  endpoint (repo private or gone) is the same *state* with a different message,
+  because "make the repo public" and "cut a release" are different fixes.
+  `/releases/latest` alone is not enough to tell them apart — it also 404s when
+  every release so far is a prerelease — so a 404 there falls through to the
+  listing rather than being believed.
+- **Presence must not stand in for correctness, again.** The archive is verified
+  against `checksums.txt` (a *missing* entry is a refusal, not a warning), and
+  then the staged binary is **executed and asked its version before any rename**.
+  A file of the right name at the right path proves nothing: a truncated unpack,
+  an archive for another architecture, and a proxy's HTML error page all produce
+  one. Verification of every binary happens before the first one moves, so a host
+  is never left with a new `tendrils` and an old `blossomd`.
+- **Atomic replace, and a rollback.** Staging dir inside the destination (so the
+  move is a same-filesystem rename), fsync, rename — the discipline `storeStream`
+  established. On Windows the running image cannot be overwritten but can be
+  renamed, so it goes to `<path>.old` and is swept up by a later run;
+  `AsidePolicy` makes that path selectable so POSIX tests exercise it and the
+  Windows CI leg exercises it for real, against a genuinely running process. If
+  the move fails after the aside, the aside is undone before the error returns.
+- **`blossomd` only where it already is**, and **before** `tendrils`.
+  `docs/UPGRADING.md` upgrades the Blossom host first; an updater that quietly
+  inverted that on a host running both would be doing the one thing the guide
+  tells owners not to do. If blossomd fails, tendrils is untouched — both stale
+  is consistent, mixed is not.
+- **The daemon reports, never upgrades.** Banner line, daily re-check, a log
+  line. Swapping a binary under a live daemon needs a restart to take effect,
+  restart is service-manager-specific, and a sync daemon that restarts itself
+  mid-pass is a new failure mode for no gain. `upgrade` prints the platform's
+  restart command and stops.
+- **Opt-out is checked before anything is scheduled.**
+  `TENDRILS_NO_UPDATE_CHECK=1` or `"update_check": false`: no cache read, no
+  spawn, no packet. An unreadable `config.json` disables the check — the question
+  is whether this device may talk to the network on its own behalf, and with the
+  owner's stated preference unreadable the honest answer is no.
+- **The notice goes to stderr**, so `tendrils status | grep` sees exactly the
+  status. It is suppressed for `version` (its output gets pasted into bug
+  reports) and for `daemon` (which prints its own).
+
+### The coordinated-upgrade gate
+
+Every release publishes a **`release.json`** asset — `wire_format` plus
+`min_compatible` — alongside `checksums.txt`. `internal/buildinfo.WireFormat` is
+what this build speaks, and a test asserts the checked-in `release.json` agrees
+with it, so a release that changes the wire format cannot ship without the
+marker that makes `upgrade` stop and ask.
+
+`upgrade` refuses to cross a declared boundary without an interactive
+confirmation or `--force`. **`--yes` is deliberately not enough**: it means "do
+not ask me the routine questions", and moving one device across a wire-format
+boundary is not routine — it manufactures exactly the split-brain the boundary
+warns about, and the losing side cannot tell. A release that declares nothing is
+not a boundary (nothing before the marker existed changed the format); a marker
+that exists but cannot be parsed **is** one, because the single file whose job is
+to say when a change is dangerous is not a file to guess about.
+
+**Bump `WireFormat` and `release.json` together** whenever old and new devices
+would disagree invisibly: the event codec, the sealing format, or an arbitration
+rule. Do not bump it for something old devices merely lack — a device that cannot
+do something new still interoperates, and a device that quietly loses does not.
 
 ## Commands
 

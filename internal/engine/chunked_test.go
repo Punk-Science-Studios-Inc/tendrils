@@ -35,7 +35,7 @@ func TestChunkedRoundTrip(t *testing.T) {
 		t.Fatalf("A sync: %v", err)
 	}
 
-	entries, err := engA.fetchRemote(context.Background())
+	entries, _, err := engA.fetchRemote(context.Background())
 	if err != nil {
 		t.Fatalf("fetch remote: %v", err)
 	}
@@ -86,7 +86,7 @@ func TestAtThresholdStaysSingleBlob(t *testing.T) {
 		t.Fatalf("sync: %v", err)
 	}
 
-	entries, err := eng.fetchRemote(context.Background())
+	entries, _, err := eng.fetchRemote(context.Background())
 	if err != nil {
 		t.Fatalf("fetch remote: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestChunkedTruncatedListIsRejected(t *testing.T) {
 		t.Fatalf("A sync: %v", err)
 	}
 
-	entries, err := engA.fetchRemote(context.Background())
+	entries, _, err := engA.fetchRemote(context.Background())
 	if err != nil {
 		t.Fatalf("fetch remote: %v", err)
 	}

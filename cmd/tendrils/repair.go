@@ -84,9 +84,14 @@ func newRepairCmd() *cobra.Command {
 			defer relays.Close()
 
 			fmt.Fprintln(out, "Fetching current file events from the relay…")
-			evts, err := relays.Fetch(ctx, id.PublicHex())
+			evts, complete, err := relays.Fetch(ctx, id.PublicHex())
 			if err != nil {
 				return fmt.Errorf("fetch events: %w", err)
+			}
+			if !complete {
+				// Repair only ever uploads, so a partial view costs coverage, not
+				// safety: it repairs what it could see and says so.
+				fmt.Fprintln(out, "Warning: the relay did not return its whole event set; some files may be missed.")
 			}
 			current, _ := engine.FoldRemote(evts)
 

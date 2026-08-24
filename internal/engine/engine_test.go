@@ -20,8 +20,22 @@ import (
 
 // fakeEvents is an in-memory relay that mimics the one property the engine
 // relies on: it keeps only the newest replaceable event per path (d tag).
+//
+// It also models the two things a real relay does that the engine has to survive:
+// a read that could not be completed (incomplete), and a read that returns
+// nothing at all (hidden), which is what a dead connection used to look like.
 type fakeEvents struct {
 	byPath map[string]*nostr.Event
+	// publishes counts every accepted event, so a test can assert that an
+	// unchanged tree published *nothing* rather than merely that the set of
+	// events ended up the same size.
+	publishes int
+	// incomplete makes Fetch report its answer as partial, as a relay that timed
+	// out or closed the subscription mid-walk now does.
+	incomplete bool
+	// hidden makes Fetch return no events at all, standing in for a relay whose
+	// pages all failed to arrive.
+	hidden bool
 }
 
 func newFakeEvents() *fakeEvents { return &fakeEvents{byPath: map[string]*nostr.Event{}} }
@@ -31,15 +45,19 @@ func (f *fakeEvents) Publish(_ context.Context, evt *nostr.Event) error {
 	if prev, ok := f.byPath[d]; !ok || evt.CreatedAt >= prev.CreatedAt {
 		f.byPath[d] = evt
 	}
+	f.publishes++
 	return nil
 }
 
-func (f *fakeEvents) Fetch(_ context.Context, _ string) ([]*nostr.Event, error) {
+func (f *fakeEvents) Fetch(_ context.Context, _ string) ([]*nostr.Event, bool, error) {
+	if f.hidden {
+		return nil, !f.incomplete, nil
+	}
 	out := make([]*nostr.Event, 0, len(f.byPath))
 	for _, e := range f.byPath {
 		out = append(out, e)
 	}
-	return out, nil
+	return out, !f.incomplete, nil
 }
 
 // fakeBlobs is an in-memory Blossom server addressed by content hash. It counts
@@ -256,7 +274,7 @@ func TestPublishLocalFile(t *testing.T) {
 		t.Fatalf("sync: %v", err)
 	}
 
-	got, err := ev.Fetch(context.Background(), id.PublicHex())
+	got, _, err := ev.Fetch(context.Background(), id.PublicHex())
 	if err != nil || len(got) != 1 {
 		t.Fatalf("expected 1 published event, got %d (err %v)", len(got), err)
 	}
@@ -296,7 +314,7 @@ func TestSyncSkipsIgnored(t *testing.T) {
 		t.Fatalf("sync: %v", err)
 	}
 
-	got, err := ev.Fetch(context.Background(), id.PublicHex())
+	got, _, err := ev.Fetch(context.Background(), id.PublicHex())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -514,5 +532,201 @@ func TestConflictCopyPreservesLocalEdit(t *testing.T) {
 	conflict := conflictCopyPath("c.md", id.PublicHex())
 	if got, ok := readFile(t, root, conflict); !ok || got != "local edit" {
 		t.Errorf("conflict copy %q = %q (present=%v), want %q", conflict, got, ok, "local edit")
+	}
+}
+
+// A tree that has already been published and has not changed must publish
+// nothing further, however many passes run over it. This is the baseline the
+// republish bug violated: on the reference fleet a 5,188-file tree had produced
+// 114,747 events, byte-identical metadata republished dozens of times per file.
+func TestUnchangedTreePublishesNothingOnLaterPasses(t *testing.T) {
+	id := mustID(t)
+	ev, bl := newFakeEvents(), newFakeBlobs()
+	root := t.TempDir()
+	writeFile(t, root, "a.md", "one", time.Unix(1_700_000_000, 0))
+	writeFile(t, root, "notes/b.md", "two", time.Unix(1_700_000_000, 0))
+
+	eng := newEngine(t, root, id, ev, bl)
+	if err := eng.Sync(context.Background()); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	if ev.publishes != 2 {
+		t.Fatalf("first pass published %d events, want 2", ev.publishes)
+	}
+	for i := 0; i < 3; i++ {
+		if err := eng.Sync(context.Background()); err != nil {
+			t.Fatalf("sync %d: %v", i+2, err)
+		}
+	}
+	if ev.publishes != 2 {
+		t.Errorf("published %d events over four passes, want 2: an unchanged tree must say nothing", ev.publishes)
+	}
+	if bl.uploads != 2 {
+		t.Errorf("uploaded %d blobs, want 2", bl.uploads)
+	}
+}
+
+// The bug, reduced: a pass whose read of the relay failed sees no entry for any
+// path, and "no entry" is what makes the reconciler publish. A read that could
+// not be completed must not be allowed to mean that.
+//
+// On the reference fleet this was one pass republishing 5,048 paths in 33
+// minutes, triggered by nothing worse than the relay connection going away for a
+// few seconds.
+func TestIncompleteRemoteViewDoesNotRepublishTheTree(t *testing.T) {
+	id := mustID(t)
+	ev, bl := newFakeEvents(), newFakeBlobs()
+	root := t.TempDir()
+	for _, p := range []string{"a.md", "b.md", "notes/c.md"} {
+		writeFile(t, root, p, "content of "+p, time.Unix(1_700_000_000, 0))
+	}
+
+	eng := newEngine(t, root, id, ev, bl)
+	if err := eng.Sync(context.Background()); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	published := ev.publishes
+
+	// The relay is now unreadable: the pages never arrived, so the fetch returns
+	// nothing and admits it is not the whole story.
+	ev.hidden, ev.incomplete = true, true
+	if err := eng.Sync(context.Background()); err != nil {
+		t.Fatalf("sync against an incomplete view: %v", err)
+	}
+	if ev.publishes != published {
+		t.Errorf("published %d more events against an incomplete view, want 0",
+			ev.publishes-published)
+	}
+
+	// And once the relay answers in full again, the pass is still a no-op —
+	// nothing was lost by waiting.
+	ev.hidden, ev.incomplete = false, false
+	if err := eng.Sync(context.Background()); err != nil {
+		t.Fatalf("sync after recovery: %v", err)
+	}
+	if ev.publishes != published {
+		t.Errorf("published %d more events after recovery, want 0", ev.publishes-published)
+	}
+}
+
+// The other half of the rule, and the reason it is not simply "never republish":
+// a relay that has genuinely lost an event must be told again. A *complete* read
+// that comes back without a path is evidence, and the engine acts on it.
+func TestCompleteButEmptyRemoteViewRepublishes(t *testing.T) {
+	id := mustID(t)
+	ev, bl := newFakeEvents(), newFakeBlobs()
+	root := t.TempDir()
+	writeFile(t, root, "a.md", "one", time.Unix(1_700_000_000, 0))
+
+	eng := newEngine(t, root, id, ev, bl)
+	if err := eng.Sync(context.Background()); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	published := ev.publishes
+
+	// The relay lost it — and says so with a complete, empty answer.
+	ev.byPath = map[string]*nostr.Event{}
+	if err := eng.Sync(context.Background()); err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+	if ev.publishes != published+1 {
+		t.Errorf("published %d events, want %d: a complete view that lacks the path is evidence, and must be acted on",
+			ev.publishes, published+1)
+	}
+}
+
+// An incomplete view must not gag a device that has something new to say. A file
+// created or edited since the last sync is published even while the relay is only
+// half-readable: that publish carries information the set does not have, and
+// withholding it would mean a flaky relay stops a device from syncing at all.
+func TestIncompleteRemoteViewStillPublishesNewWork(t *testing.T) {
+	id := mustID(t)
+	ev, bl := newFakeEvents(), newFakeBlobs()
+	root := t.TempDir()
+	writeFile(t, root, "old.md", "already synced", time.Unix(1_700_000_000, 0))
+
+	eng := newEngine(t, root, id, ev, bl)
+	if err := eng.Sync(context.Background()); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	published := ev.publishes
+
+	writeFile(t, root, "new.md", "brand new", time.Unix(1_700_000_500, 0))
+	writeFile(t, root, "old.md", "edited since", time.Unix(1_700_000_600, 0))
+	ev.hidden, ev.incomplete = true, true
+	if err := eng.Sync(context.Background()); err != nil {
+		t.Fatalf("sync against an incomplete view: %v", err)
+	}
+	if ev.publishes != published+2 {
+		t.Errorf("published %d events, want %d (the new file and the edited one)",
+			ev.publishes-published, 2)
+	}
+}
+
+// signEntryAt signs an entry with an explicit publication stamp. FoldRemote
+// arbitrates on created_at, so a test of it has to place events on that axis
+// deliberately — and the stamp must be set before signing or the signature does
+// not cover it.
+func signEntryAt(t *testing.T, id *keys.Identity, e *tree.Entry, createdAt int64) *nostr.Event {
+	t.Helper()
+	evt, err := nostrevent.Build(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evt.CreatedAt = nostr.Timestamp(createdAt)
+	if err := evt.Sign(id.SecretHex()); err != nil {
+		t.Fatal(err)
+	}
+	return evt
+}
+
+// A relay that hands back superseded versions of a path — which the reference
+// relay does for every path whose d tag runs past 100 bytes, because its tag
+// index will not index a value that long and replacement therefore never fires —
+// must be folded the way the relay would have folded it: latest publish wins.
+//
+// Folding by mtime instead silently undid restores. Roll a file back to an older
+// version, publish it, and the superseded event describing the newer version
+// still won the fold, so the restoring device pulled its own file back.
+func TestFoldRemoteKeepsTheLatestPublishNotTheNewestMtime(t *testing.T) {
+	id := mustID(t)
+	newer := &tree.Entry{Path: "song.flac", Sha256: "newversion", BlobHash: "blobnew", Size: 2, ModTime: time.Unix(1_700_000_500, 0)}
+	restored := &tree.Entry{Path: "song.flac", Sha256: "oldversion", BlobHash: "blobold", Size: 1, ModTime: time.Unix(1_700_000_000, 0)}
+
+	evts := []*nostr.Event{
+		signEntryAt(t, id, newer, 1_800_000_000),    // published first
+		signEntryAt(t, id, restored, 1_800_000_100), // then the rollback
+	}
+	got, skipped := FoldRemote(evts)
+	if len(skipped) != 0 {
+		t.Fatalf("skipped %d events: %v", len(skipped), skipped)
+	}
+	if got["song.flac"].Sha256 != "oldversion" {
+		t.Errorf("fold chose %q, want the most recent publish %q",
+			got["song.flac"].Sha256, "oldversion")
+	}
+}
+
+// Republished-but-identical events differ only in their blob address (every
+// pre-deterministic-sealing pass sealed the same bytes to a different blob). They
+// tie on mtime and on content hash, so the old fold fell through to map order and
+// named whichever event the fetch happened to return first. Two folds of the same
+// events could then name different blobs — and the blob collector folds with this
+// same function, so it and the engine could disagree about which blob is live.
+func TestFoldRemoteIsOrderIndependentAcrossIdenticalRepublishes(t *testing.T) {
+	id := mustID(t)
+	mtime := time.Unix(1_700_000_000, 0)
+	entry := func(blobHash string) *tree.Entry {
+		return &tree.Entry{Path: "cover.jpg", Sha256: "samecontent", BlobHash: blobHash, Size: 3, ModTime: mtime}
+	}
+	first := signEntryAt(t, id, entry("blob-from-an-old-pass"), 1_800_000_000)
+	second := signEntryAt(t, id, entry("blob-from-a-later-pass"), 1_800_000_050)
+
+	for _, order := range [][]*nostr.Event{{first, second}, {second, first}} {
+		got, _ := FoldRemote(order)
+		if got["cover.jpg"].BlobHash != "blob-from-a-later-pass" {
+			t.Errorf("fold chose blob %q, want the latest publish's %q (input order must not matter)",
+				got["cover.jpg"].BlobHash, "blob-from-a-later-pass")
+		}
 	}
 }

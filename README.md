@@ -38,6 +38,34 @@ tendrils version     # full build identity — version, commit, build date, Go v
 tendrils --version   # one line
 ```
 
+### Staying current
+
+Once installed, Tendrils updates itself on request:
+
+```sh
+tendrils upgrade            # download the latest release, verify it, replace both binaries
+tendrils upgrade --check    # report only; exits non-zero when an upgrade is available
+tendrils upgrade --version v0.3.0   # install an exact release, including a rollback
+```
+
+Every download is verified against the release's `checksums.txt`, and the new
+binary is executed and asked its version *before* it replaces anything — a
+failed upgrade leaves the working binary exactly where it was. The daemon is
+never restarted for you; the command prints the restart line for your platform.
+
+A background check runs at most once a day and prints a short notice on stderr
+when a newer release exists. It never delays a command, offline is silent, and
+it is off entirely with `TENDRILS_NO_UPDATE_CHECK=1` or `"update_check": false`
+in `config.json`.
+
+This matters more than a convenience feature usually would: **a device on a
+stale build cannot always tell that it is broken.** A wire-format change has
+already once been invisible on the losing device — its events were dropped by
+the relay and nothing on it could say so. A release that changes the wire format
+declares it, and `upgrade` refuses to cross that boundary without an explicit
+confirmation, because upgrading one device across it is worse than upgrading
+none. See **[docs/UPGRADING.md](docs/UPGRADING.md)**.
+
 Upgrading an existing fleet — including the one-time repair steps after this
 release — is documented in **[docs/UPGRADING.md](docs/UPGRADING.md)**. Report the
 output of `tendrils version` from each device when a fleet disagrees: a wire

@@ -55,6 +55,17 @@ jobs:
       # for that reason.
       - run: go test ./...
 
+      # Called out separately, and only on Windows, because `tendrils upgrade`
+      # replaces a *running* executable — the exact class of defect this matrix
+      # entry exists for, and one this project has already shipped once. These
+      # tests copy the test binary, run it, and swap it out underneath itself:
+      # on POSIX that is a plain rename, on Windows it needs the locked image
+      # renamed aside first. A POSIX-only run proves nothing here, and a failure
+      # buried in `go test ./...` above is easy to misread as unrelated.
+      - name: self-update replaces a running binary (Windows semantics)
+        if: matrix.os == 'windows-latest'
+        run: go test ./internal/selfupdate/ -run "Apply|VerifyByExec|CleanupOld|EndToEnd" -v
+
   # The daemon is concurrent (status server, progress callbacks, GC workers), so
   # the race detector earns its keep — but it needs cgo, which the rest of the
   # project deliberately does without. Isolated here so the matrix above stays

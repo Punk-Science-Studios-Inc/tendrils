@@ -23,8 +23,13 @@ const (
 	keyFile        = "key"
 	indexFile      = "index.db"
 	daemonAddrFile = "daemon.addr"
+	updateFile     = "update.json"
 	// envHome overrides the state directory, for tests and power users.
 	envHome = "TENDRILS_HOME"
+	// envNoUpdateCheck disables the background update check outright. A daemon
+	// on a locked-down host must be able to never phone home, without editing a
+	// config file it may not own.
+	envNoUpdateCheck = "TENDRILS_NO_UPDATE_CHECK"
 )
 
 // Config is the local, user-editable configuration.
@@ -37,6 +42,10 @@ type Config struct {
 	// BlossomServers lists Blossom server URLs for blob storage. Empty means
 	// "discover from the key".
 	BlossomServers []string `json:"blossom_servers,omitempty"`
+	// UpdateCheck enables the background check for a newer release. A pointer so
+	// that absent means "the default", and Save round-trips a config that never
+	// set it instead of writing an opinion the owner did not express.
+	UpdateCheck *bool `json:"update_check,omitempty"`
 }
 
 // Dir returns the Tendrils state directory, honouring $TENDRILS_HOME, else the
@@ -83,6 +92,40 @@ func DaemonAddrPath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, daemonAddrFile), nil
+}
+
+// UpdatePath returns the path to the update-check cache. It lives in the state
+// directory like everything else, so $TENDRILS_HOME isolates it in tests and a
+// second identity on one machine keeps its own.
+func UpdatePath() (string, error) {
+	dir, err := Dir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, updateFile), nil
+}
+
+// UpdateCheckEnabled reports whether this device may check for a newer release.
+// Both opt-outs are consulted here, before anything schedules a network call:
+// TENDRILS_NO_UPDATE_CHECK in the environment, and "update_check": false in
+// config.json.
+//
+// A config file that cannot be read or parsed disables the check. That is the
+// conservative direction: the question being asked is "may this device talk to
+// the network on its own behalf", and the honest answer when the owner's stated
+// preference is unreadable is no.
+func UpdateCheckEnabled() bool {
+	if v := strings.TrimSpace(os.Getenv(envNoUpdateCheck)); v != "" && v != "0" && !strings.EqualFold(v, "false") {
+		return false
+	}
+	cfg, found, err := Load()
+	if err != nil {
+		return false
+	}
+	if !found || cfg.UpdateCheck == nil {
+		return true
+	}
+	return *cfg.UpdateCheck
 }
 
 // Load reads the local config file. A missing file is not an error: it returns

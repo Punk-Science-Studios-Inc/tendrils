@@ -46,7 +46,12 @@ import (
 // a go-nostr relay client; tests use an in-memory fake.
 type EventStore interface {
 	Publish(ctx context.Context, evt *nostr.Event) error
-	Fetch(ctx context.Context, pubkey string) ([]*nostr.Event, error)
+	// Fetch returns every file-entry event the owner's key has published, and
+	// whether that answer is the complete set. The second return value is not
+	// advisory: absence of a path from an *incomplete* set is not evidence that
+	// the path is unpublished, and treating it as such is what republishes a whole
+	// tree. See Sync's withheldByPartialView.
+	Fetch(ctx context.Context, pubkey string) (evts []*nostr.Event, complete bool, err error)
 }
 
 // BlobStore is the file-content side. *blob.Client satisfies it directly.
@@ -162,7 +167,7 @@ func (e *Engine) Sync(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("engine: scan: %w", err)
 	}
-	remote, err := e.fetchRemote(ctx)
+	remote, remoteComplete, err := e.fetchRemote(ctx)
 	if err != nil {
 		return fmt.Errorf("engine: fetch remote: %w", err)
 	}
@@ -178,6 +183,7 @@ func (e *Engine) Sync(ctx context.Context) error {
 	// what turns per-file progress into "3 of 12".
 	now := time.Now()
 	var plan []plannedAction
+	var withheld int
 	for _, path := range unionPaths(local, base, remote) {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -191,6 +197,13 @@ func (e *Engine) Sync(ctx context.Context) error {
 		if d.Op == reconcile.OpNone {
 			continue
 		}
+		// An incomplete read of the relay cannot be read as "the set has never
+		// heard of this path". Acting on that mistake is how a device republishes
+		// a tree it has already published, so hold those paths back entirely.
+		if !remoteComplete && withheldByPartialView(d, base[path], local[path], remote[path]) {
+			withheld++
+			continue
+		}
 		plan = append(plan, plannedAction{
 			path:     path,
 			decision: d,
@@ -198,6 +211,19 @@ func (e *Engine) Sync(ctx context.Context) error {
 			remote:   remote[path],
 			deferred: retries[path].NextAttempt.After(now),
 		})
+	}
+
+	if withheld > 0 {
+		e.log.Warn("relay view incomplete: leaving already-published paths alone this pass",
+			"paths", withheld, "read", len(remote))
+	}
+	// A path too long for the relay to index is a path the relay cannot replace,
+	// so every publish of it is kept forever rather than superseding the last.
+	// Only worth saying on a pass that is actually about to add one — on a settled
+	// tree it says nothing.
+	if n := overlongPublishes(plan); n > 0 {
+		e.log.Warn("publishing paths a relay cannot replace: their old events will accumulate on the relay",
+			"paths", n, "limit_bytes", nostrevent.MaxIndexedTagValue)
 	}
 
 	// Publish the pass's outstanding-work counts for the status endpoint, so a
@@ -241,6 +267,53 @@ func (e *Engine) Sync(ctx context.Context) error {
 		errs = append(errs, fmt.Errorf("record last-reconcile: %w", err))
 	}
 	return errors.Join(errs...)
+}
+
+// withheldByPartialView reports whether a planned action rests entirely on the
+// *absence* of a remote entry that this pass could not prove absent.
+//
+// Only one decision does: reconcile's "local-only file, publish to set", which
+// fires when the folded remote set has no entry for the path. When the read of
+// the relay was complete that is a fact and republishing is right — a relay that
+// genuinely lost or expired an event must be told again. When the read was
+// incomplete it is not a fact, it is a missing answer, and the honest response to
+// a missing answer is to do nothing and ask again next pass.
+//
+// The line is drawn at the index base. A path the index says we already published
+// at exactly this content has nothing new to contribute, so silence about it
+// costs nothing to ignore. A path with no base — a genuinely new or locally
+// changed file — is published anyway: a device on a flaky relay must still be
+// able to get its work out, and that publish carries information the set does not
+// already have.
+//
+// Nothing is abandoned by this. A withheld path is re-examined every pass and
+// acted on the first time the relay answers in full.
+func withheldByPartialView(d reconcile.Decision, base, local, remote *tree.Entry) bool {
+	if remote != nil {
+		return false // the view did say something about this path
+	}
+	if d.Op != reconcile.OpPublishLocal {
+		return false
+	}
+	if !base.Live() {
+		return false // never synced here: publishing it is new information
+	}
+	return tree.SameContent(base, local)
+}
+
+// overlongPublishes counts planned publishes whose path is longer than a relay
+// will index as a d tag — see nostrevent.MaxIndexedTagValue.
+func overlongPublishes(plan []plannedAction) int {
+	n := 0
+	for _, a := range plan {
+		switch a.decision.Op {
+		case reconcile.OpPublishLocal, reconcile.OpPublishDelete:
+			if nostrevent.PathTooLongForRelay(a.path) {
+				n++
+			}
+		}
+	}
+	return n
 }
 
 // passStats derives the status counts from a pass's scan and plan: pending is the
@@ -587,18 +660,20 @@ func (e *Engine) publish(ctx context.Context, entry *tree.Entry) error {
 }
 
 // fetchRemote asks the relay for the owner's file-entry events and folds them
-// into the current per-path truth, keeping the newest by mtime. A single
-// unparseable event (bad signature, wrong kind) is skipped, not fatal.
-func (e *Engine) fetchRemote(ctx context.Context) (map[string]*tree.Entry, error) {
-	evts, err := e.events.Fetch(ctx, e.id.PublicHex())
+// into the current per-path truth, keeping the latest publish per path (see
+// FoldRemote). A single unparseable event (bad signature, wrong kind) is skipped,
+// not fatal. The bool is the fetch's own report of whether that set is complete;
+// Sync must have it to tell "no such path" from "no answer".
+func (e *Engine) fetchRemote(ctx context.Context) (map[string]*tree.Entry, bool, error) {
+	evts, complete, err := e.events.Fetch(ctx, e.id.PublicHex())
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	out, skipped := FoldRemote(evts)
 	for _, err := range skipped {
 		e.log.Warn("skipping unparseable event", "err", err)
 	}
-	return out, nil
+	return out, complete, nil
 }
 
 // FoldRemote folds raw file-entry events into the current per-path truth, and
@@ -608,11 +683,28 @@ func (e *Engine) fetchRemote(ctx context.Context) (map[string]*tree.Entry, error
 // is true?" must fold by exactly this rule. Blob collection is the case that
 // forced it: a sweeper deciding which blobs are live has to agree with the engine
 // about which event wins per path, or it will either spare garbage forever or
-// delete a blob a device is about to pull. Relays may retain superseded
-// replaceable events, so the raw event list holds several versions of a path and
-// folding is not optional.
+// delete a blob a device is about to pull.
+//
+// The rule is NIP-01's own: for a parameterized replaceable event the current one
+// is the greatest created_at for (pubkey, kind, d), ties broken by the lexically
+// smallest id. Folding is not optional, because a relay may hand back superseded
+// versions — this project's reference relay keeps every version of any path whose
+// d tag exceeds 100 bytes, its tag index silently declining to index a value that
+// long, so replacement never fires for those paths.
+//
+// It deliberately does *not* fold by the mtime tag. mtime says which version of
+// the file is newer, which is reconcile's question; created_at says which publish
+// is current, which is the relay's. Folding by mtime got both wrong: restoring an
+// older version of a file was silently undone (the superseded event describing
+// the newer version still won the fold), and versions that tied on mtime and hash
+// — every republish of an unchanged file, of which the reference relay holds
+// tens of thousands — resolved to whichever event the fetch happened to return
+// first. That last one is the dangerous half: two folds of the same events in a
+// different order could name different blob addresses, so the collector and the
+// engine could disagree about which blob is live.
 func FoldRemote(evts []*nostr.Event) (map[string]*tree.Entry, []error) {
 	out := make(map[string]*tree.Entry, len(evts))
+	kept := make(map[string]*nostr.Event, len(evts))
 	var skipped []error
 	for _, evt := range evts {
 		entry, err := nostrevent.Parse(evt)
@@ -620,28 +712,25 @@ func FoldRemote(evts []*nostr.Event) (map[string]*tree.Entry, []error) {
 			skipped = append(skipped, err)
 			continue
 		}
-		if prev, ok := out[entry.Path]; !ok || supersedes(entry, prev) {
-			out[entry.Path] = entry
+		if prev, ok := kept[entry.Path]; ok && !supersedes(evt, prev) {
+			continue
 		}
+		kept[entry.Path] = evt
+		out[entry.Path] = entry
 	}
 	return out, skipped
 }
 
-// supersedes reports whether a should replace b as the remote truth for a path.
-// Newer mtime wins; an exact tie is broken by content hash, matching the rule
-// reconcile uses for local-vs-remote. Without that tie-break the winner would
-// depend on Go's map iteration order, so two devices folding the same set of
-// events could disagree about what "remote" is and publish over each other
-// indefinitely. A tombstone beats a live entry at the same instant — delete is
-// absolute, and its hash is empty, which would otherwise lose the comparison.
-func supersedes(a, b *tree.Entry) bool {
-	if !a.ModTime.Equal(b.ModTime) {
-		return a.ModTime.After(b.ModTime)
+// supersedes reports whether event a replaces event b as the relay's current
+// version of a path: greater created_at wins, and an exact tie goes to the
+// lexically smaller id, which is what NIP-01 tells relays to retain. Deciding it
+// the same way the relay would is the point — every device then agrees, and a
+// relay that does replace properly and one that does not produce the same answer.
+func supersedes(a, b *nostr.Event) bool {
+	if a.CreatedAt != b.CreatedAt {
+		return a.CreatedAt > b.CreatedAt
 	}
-	if a.Deleted != b.Deleted {
-		return a.Deleted
-	}
-	return a.Sha256 > b.Sha256
+	return a.ID < b.ID
 }
 
 // preserveConflictCopy copies the current local file to a conflict-marked

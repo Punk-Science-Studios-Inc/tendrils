@@ -63,6 +63,9 @@ func newDaemonCmd() *cobra.Command {
 			defer relays.Close()
 
 			log := slog.New(slog.NewTextHandler(cmd.OutOrStdout(), nil))
+			// So a fetch that came back incomplete says why, rather than only
+			// showing up as a pass that quietly did less than it might have.
+			relays.SetLogger(log)
 
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt)
 			defer stop()
@@ -93,16 +96,30 @@ func newDaemonCmd() *cobra.Command {
 			stopStatus := serveStatus(&statusServer{id: id, cfg: &cfg, idx: idx, state: state}, log)
 			defer stopStatus()
 
+			// A binary the previous upgrade could not delete because this
+			// process's predecessor still held it open. The restart that made
+			// this daemon is the first moment that is no longer true.
+			cleanupSupersededBinaries()
+
 			npub, _ := id.Npub()
 			out := cmd.OutOrStdout()
 			fmt.Fprintln(out, "Tendrils daemon starting:")
 			fmt.Fprintln(out, "  Version:  ", buildinfo.Get())
+			// Beside the version, because they answer the same question: a
+			// device that cannot tell it is stale is the failure this reports.
+			if summary := updateSummary(buildinfo.Get().Version, buildinfo.WireFormat); summary != "" {
+				fmt.Fprintln(out, "  Update:   ", summary)
+			}
 			fmt.Fprintln(out, "  Identity: ", npub)
 			fmt.Fprintln(out, "  Sync root:", cfg.SyncRoot)
 			fmt.Fprintln(out, "  Relays:   ", cfg.Relays)
 			fmt.Fprintln(out, "  Storage:  ", cfg.BlossomServers)
 			fmt.Fprintln(out, "  Interval: ", interval)
 			fmt.Fprintln(out)
+
+			// Long-lived process, long interval: a fleet-wide fix should not
+			// wait for someone to remember to run a command on this device.
+			go watchUpdates(ctx, log)
 
 			return runLoop(ctx, eng, interval, log, state)
 		},
@@ -127,6 +144,13 @@ func resolveBlossom(ctx context.Context, cfg *config.Config, id *keys.Identity, 
 	discovered, err := relays.FetchServerList(ctx, id.PublicHex())
 	if err != nil {
 		log.Warn("could not fetch published Blossom server list", "err", err)
+		if len(cfg.BlossomServers) == 0 {
+			return fmt.Errorf("no Blossom server configured, and the owner's published list could not be read from the relay: %w", err)
+		}
+		// The union below would be built from a failed read, which is not an empty
+		// list — publishing it would drop every server this device happens not to
+		// have configured. Leave the published list alone until a read succeeds.
+		return nil
 	}
 
 	if len(cfg.BlossomServers) == 0 {

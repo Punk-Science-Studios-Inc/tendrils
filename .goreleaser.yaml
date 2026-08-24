@@ -80,10 +80,25 @@ changelog:
 release:
   draft: false
   prerelease: auto # a -rc/-beta tag publishes as a prerelease automatically
+  extra_files:
+    # The coordinated-upgrade marker `tendrils upgrade` reads before it installs
+    # anything: wire_format + min_compatible. Without it a release cannot tell an
+    # updater that every device has to move together, and crossing that boundary
+    # one device at a time is worse than not upgrading at all (see "Two clocks"
+    # in AGENTS.md). It is checked into the repo beside this file and asserted
+    # against internal/buildinfo.WireFormat by a test, so the two cannot drift.
+    #
+    # It is deliberately not listed in checksums.txt: it is advisory metadata
+    # read over the same TLS connection as everything else, while the archive it
+    # describes is verified byte for byte before a single byte is executed.
+    - glob: release.json
   footer: |
     ## Install
 
     Linux / macOS:  `curl -fsSL https://raw.githubusercontent.com/Punk-Science-Studios-Inc/tendrils/main/install.sh | sh`
     Windows:        `irm https://raw.githubusercontent.com/Punk-Science-Studios-Inc/tendrils/main/install.ps1 | iex`
+
+    Already installed? `tendrils upgrade` downloads this release, verifies it
+    against `checksums.txt`, and replaces both binaries in place.
 
     Upgrade every device together when a release says the wire format changed.
