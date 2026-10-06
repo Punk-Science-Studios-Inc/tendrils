@@ -31,6 +31,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 		SyncRoot:       "/home/sam/vault",
 		Relays:         []string{"wss://relay.example"},
 		BlossomServers: []string{"https://blossom.example"},
+		Exclude:        []string{"music/", "*.iso"},
 	}
 	if err := Save(in); err != nil {
 		t.Fatal(err)
@@ -44,6 +45,11 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	}
 	if got.SyncRoot != in.SyncRoot || len(got.Relays) != 1 || got.Relays[0] != in.Relays[0] {
 		t.Errorf("config round-trip mismatch: %+v", got)
+	}
+	// Per-device excludes must survive a save/load: a restart has to keep a
+	// node's opt-outs, and they must not leak into anything published.
+	if len(got.Exclude) != 2 || got.Exclude[0] != "music/" || got.Exclude[1] != "*.iso" {
+		t.Errorf("exclude round-trip mismatch: %+v", got.Exclude)
 	}
 }
 

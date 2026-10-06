@@ -78,6 +78,54 @@ func (m *Matcher) Match(relPath string) bool {
 	return ignored
 }
 
+// PruneDir reports whether nothing under relDir (a forward-slash, sync-root-
+// relative directory) can be un-ignored, so a walker may skip it without
+// reading its contents. Every path beneath the directory is matched by the last
+// rule that covers the directory itself; only a later negation could
+// re-include one of them, so any later negation keeps the directory open.
+func (m *Matcher) PruneDir(relDir string) bool {
+	if m == nil {
+		return false
+	}
+	ds := strings.Split(relDir, "/")
+	last := -1
+	for i, r := range m.rules {
+		if r.coversDir(ds) {
+			last = i
+		}
+	}
+	if last < 0 || m.rules[last].neg {
+		return false
+	}
+	for _, r := range m.rules[last+1:] {
+		if r.neg {
+			return false
+		}
+	}
+	return true
+}
+
+// coversDir reports whether the rule matches directory segments ds or one of
+// their ancestors, and therefore every path beneath ds.
+func (r rule) coversDir(ds []string) bool {
+	if r.anchored {
+		for k := 1; k <= len(ds); k++ {
+			if matchSegs(r.segs, ds[:k]) {
+				return true
+			}
+		}
+		return false
+	}
+	for start := 0; start < len(ds); start++ {
+		for end := start + 1; end <= len(ds); end++ {
+			if matchSegs(r.segs, ds[start:end]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // match reports whether the rule matches file path segments ps. A rule matches
 // either the file itself or one of its ancestor directories (so a directory rule
 // ignores everything beneath it).

@@ -51,7 +51,9 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(
 		newKeygenCmd(),
 		newEnrollCmd(),
+		newAdoptCmd(),
 		newStatusCmd(),
+		newExcludeCmd(),
 		newDaemonCmd(),
 		newGCCmd(),
 		newRepairCmd(),

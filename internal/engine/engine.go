@@ -37,6 +37,7 @@ import (
 	"ca.punkscience.tendrils/internal/keys"
 	"ca.punkscience.tendrils/internal/nostrevent"
 	"ca.punkscience.tendrils/internal/reconcile"
+	"ca.punkscience.tendrils/internal/rootid"
 	"ca.punkscience.tendrils/internal/scan"
 	"ca.punkscience.tendrils/internal/tree"
 )
@@ -76,6 +77,7 @@ type Progress struct {
 // Engine holds the wiring for one synced folder on one device.
 type Engine struct {
 	root        string
+	rootID      rootid.Identity
 	id          *keys.Identity
 	symKey      [32]byte
 	idx         *index.Store
@@ -85,6 +87,10 @@ type Engine struct {
 	report      func(Progress)
 	statsReport func(Stats)
 	chunkSize   int64
+	// exclude is this node's own ignore patterns, from config.json. They are
+	// applied after the synced .tendrilsignore, so a device can hide a subtree
+	// from itself without changing what any other device syncs.
+	exclude []string
 }
 
 // OnProgress registers a callback invoked as each planned action begins and once
@@ -104,6 +110,12 @@ type Stats struct {
 	Pending   int // local changes still to push (uploads and tombstones)
 	Conflicts int // conflict copies sitting in the tree, awaiting the owner
 	Deferred  int // paths held back by retry backoff after repeated failures
+	// Unavailable counts paths, and unreadable or unsupported places, the scan
+	// could not observe. Nothing under them is synced or deleted until it can be.
+	Unavailable int
+	// Paused says why no work was done at all — the root is missing, is not the
+	// enrolled folder, or the ignore rules cannot be read. Empty when syncing.
+	Paused string
 }
 
 // OnStats registers a callback given, once per pass, that pass's outstanding
@@ -118,6 +130,14 @@ func (e *Engine) reportStats(s Stats) {
 	}
 }
 
+// SetExclude supplies this node's per-device ignore patterns (config.json's
+// "exclude"). They are compiled alongside the synced .tendrilsignore on every
+// pass, so a change takes effect without rebuilding the engine. A path either
+// set ignores is invisible to reconcile — never pulled, published, trashed or
+// tombstoned — which is what lets a node drop a subtree locally while every
+// other node keeps syncing it. Call before Sync; not safe to call concurrently.
+func (e *Engine) SetExclude(patterns []string) { e.exclude = patterns }
+
 // plannedAction is one path the reconciler decided needs work, captured up front
 // so the pass knows its total before executing (that count is what "3 of 12" needs).
 type plannedAction struct {
@@ -131,8 +151,9 @@ type plannedAction struct {
 }
 
 // New builds an Engine. It derives the blob-encryption key from id up front so
-// every seal/open in a Sync reuses it.
-func New(root string, id *keys.Identity, idx *index.Store, blobs BlobStore, events EventStore, log *slog.Logger) (*Engine, error) {
+// every seal/open in a Sync reuses it. rootID is the identity recorded when root
+// was enrolled; a pass does nothing unless root still carries it.
+func New(root string, rootID rootid.Identity, id *keys.Identity, idx *index.Store, blobs BlobStore, events EventStore, log *slog.Logger) (*Engine, error) {
 	if log == nil {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
@@ -142,6 +163,7 @@ func New(root string, id *keys.Identity, idx *index.Store, blobs BlobStore, even
 	}
 	return &Engine{
 		root:   root,
+		rootID: rootID,
 		id:     id,
 		symKey: symKey,
 		idx:    idx,
@@ -156,16 +178,41 @@ func New(root string, id *keys.Identity, idx *index.Store, blobs BlobStore, even
 // Sync runs one full reconcile pass over every path known locally, in the index,
 // or on the relay. Per-path failures are collected and joined, not fatal: one
 // unreadable file or unreachable blob must not stall the rest of the tree.
+//
+// A root that is missing or is not the enrolled folder pauses the pass before
+// anything is read: an unmounted drive's empty mountpoint scans exactly like a
+// tree whose every file was deleted.
 func (e *Engine) Sync(ctx context.Context) error {
+	if err := e.verifyRoot(); err != nil {
+		return err
+	}
+	// The ignore file (.tendrilsignore at the root) is itself a synced file, read
+	// fresh each pass so edits take effect without a restart. Unreadable rules
+	// pause the pass: guessing them empty would publish what they hide.
+	ign, err := e.loadIgnore()
+	if err != nil {
+		return e.pause(err)
+	}
 	base, err := e.idx.All()
 	if err != nil {
 		return fmt.Errorf("engine: read index: %w", err)
 	}
+	mounts, err := e.idx.Mounts()
+	if err != nil {
+		return fmt.Errorf("engine: read mounts: %w", err)
+	}
 	// The base doubles as the scan's mtime+size cache: unchanged files are not
 	// re-hashed, so a pass over a large tree costs a stat per file, not a full read.
-	local, err := scan.Tree(e.root, base)
+	scanned, err := scan.Tree(e.root, scan.Options{Base: base, Ignore: ign, Mounts: mounts})
 	if err != nil {
 		return fmt.Errorf("engine: scan: %w", err)
+	}
+	local, cov := scanned.Entries, scanned.Coverage
+	if n := len(cov.Mounts) - len(mounts); n > 0 {
+		e.log.Warn("subordinate mount points are not synced; their contents are held back", "mounts", cov.Mounts[len(mounts):])
+		if err := e.idx.AddMounts(cov.Mounts[len(mounts):]); err != nil {
+			return fmt.Errorf("engine: record mounts: %w", err)
+		}
 	}
 	remote, remoteComplete, err := e.fetchRemote(ctx)
 	if err != nil {
@@ -175,22 +222,25 @@ func (e *Engine) Sync(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("engine: read retry state: %w", err)
 	}
-	// The ignore file (.tendrilsignore at the root) is itself a synced file, read
-	// fresh each pass so edits take effect without a restart.
-	ign := e.loadIgnore()
 
 	// Plan first, so the total is known before any action runs — that count is
 	// what turns per-file progress into "3 of 12".
 	now := time.Now()
 	var plan []plannedAction
 	var withheld int
+	unseen := newUnseen(cov, ign)
 	for _, path := range unionPaths(local, base, remote) {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		// Ignored paths are invisible to reconcile: never published, pulled, or
 		// deleted. Any already-synced copy is left frozen in place, not removed.
-		if ign.Match(path) {
+		if scan.Reserved(path) || ign.Match(path) {
+			continue
+		}
+		// A path the scan could not see is unknown, not deleted, and nothing may
+		// be written over what could not be read.
+		if unseen.hold(path) {
 			continue
 		}
 		d := reconcile.Decide(base[path], local[path], remote[path])
@@ -231,7 +281,13 @@ func (e *Engine) Sync(ctx context.Context) error {
 	// for its own full-tree rescan. Deferred paths are counted as pending too:
 	// work held back by backoff is still outstanding, and hiding it would report
 	// a tree as synced when it is not.
-	e.reportStats(passStats(local, plan))
+	stats := passStats(local, plan)
+	stats.Unavailable = unseen.count()
+	if stats.Unavailable > 0 {
+		e.log.Warn("parts of the tree could not be observed; nothing under them is synced or deleted",
+			"unavailable", stats.Unavailable, "examples", unseen.examples(3))
+	}
+	e.reportStats(stats)
 
 	// Acting only on what is not in backoff keeps a permanently-failing file from
 	// consuming a slot and two log lines every pass, and keeps the progress total
@@ -252,6 +308,11 @@ func (e *Engine) Sync(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if destructive(a.decision.Op) {
+			if err := e.verifyRoot(); err != nil {
+				return errors.Join(append(errs, err)...)
+			}
+		}
 		e.reportProgress(Progress{Done: i, Total: total, Path: a.path, Op: verb(a.decision.Op)})
 		e.log.Info("reconcile", "path", a.path, "op", a.decision.Op.String(), "reason", a.decision.Reason)
 		err := e.execute(ctx, a.path, a.decision, a.local, a.remote)
@@ -267,6 +328,103 @@ func (e *Engine) Sync(ctx context.Context) error {
 		errs = append(errs, fmt.Errorf("record last-reconcile: %w", err))
 	}
 	return errors.Join(errs...)
+}
+
+// Paused is returned by a pass that did no work because the root, or the rules
+// for reading it, could not be trusted. It is a state to wait out, not a failure
+// of any one path.
+type Paused struct{ Cause error }
+
+func (p *Paused) Error() string { return "sync paused: " + p.Cause.Error() }
+func (p *Paused) Unwrap() error { return p.Cause }
+
+func (e *Engine) pause(cause error) error {
+	p := &Paused{Cause: cause}
+	e.reportStats(Stats{Paused: cause.Error()})
+	return p
+}
+
+// verifyRoot pauses unless the root is still the enrolled folder.
+func (e *Engine) verifyRoot() error {
+	if err := rootid.Verify(e.root, e.rootID); err != nil {
+		return e.pause(err)
+	}
+	return nil
+}
+
+// destructive reports whether an action removes or replaces local content or
+// tells other devices to. Each is preceded by a fresh root check, so a drive
+// unmounted mid-pass stops the pass instead of finishing it on an empty folder.
+func destructive(op reconcile.Op) bool {
+	switch op {
+	case reconcile.OpDeleteLocal, reconcile.OpPublishDelete, reconcile.OpWriteRemote:
+		return true
+	}
+	return false
+}
+
+// unseen tracks which scan gaps held paths back this pass, so status can report
+// both the known paths it could not judge and the unreadable places holding
+// nothing known — an unsupported file the owner has just created, say.
+type unseen struct {
+	cov  scan.Coverage
+	ign  *ignore.Matcher
+	hits map[string]int
+	held int
+}
+
+func newUnseen(cov scan.Coverage, ign *ignore.Matcher) *unseen {
+	return &unseen{cov: cov, ign: ign, hits: make(map[string]int)}
+}
+
+// CountUnavailable counts, over a set of known paths, the ones a scan could not
+// observe plus the unobserved places holding none of them — the figure a pass
+// reports as Stats.Unavailable. Ignored and reserved paths are not counted.
+func CountUnavailable(cov scan.Coverage, ign *ignore.Matcher, paths []string) int {
+	u := newUnseen(cov, ign)
+	for _, p := range paths {
+		if !scan.Reserved(p) && !ign.Match(p) {
+			u.hold(p)
+		}
+	}
+	return u.count()
+}
+
+func (u *unseen) hold(path string) bool {
+	gap, ok := u.cov.GapFor(path)
+	if !ok {
+		return false
+	}
+	u.hits[gap]++
+	u.held++
+	return true
+}
+
+func (u *unseen) count() int {
+	n := u.held
+	for _, g := range u.cov.Gaps {
+		if u.hits[g.Path] == 0 && !u.ignored(g.Path) {
+			n++
+		}
+	}
+	return n
+}
+
+func (u *unseen) ignored(path string) bool {
+	return u.ign.Match(path) || u.ign.PruneDir(path)
+}
+
+func (u *unseen) examples(n int) []string {
+	var out []string
+	for _, g := range u.cov.Gaps {
+		if len(out) == n {
+			break
+		}
+		if !u.ignored(g.Path) {
+			out = append(out, g.Path+": "+g.Reason)
+		}
+	}
+	return out
 }
 
 // withheldByPartialView reports whether a planned action rests entirely on the
@@ -767,14 +925,28 @@ func (e *Engine) abs(relSlash string) string {
 	return filepath.Join(e.root, filepath.FromSlash(relSlash))
 }
 
-// loadIgnore reads the sync root's .tendrilsignore into a matcher. A missing or
-// unreadable file yields an empty matcher (nothing ignored).
-func (e *Engine) loadIgnore() *ignore.Matcher {
-	data, err := os.ReadFile(filepath.Join(e.root, ignore.FileName))
-	if err != nil {
-		return ignore.Compile(nil)
+// loadIgnore reads the sync root's .tendrilsignore into a matcher.
+func (e *Engine) loadIgnore() (*ignore.Matcher, error) {
+	return IgnoreMatcher(e.root, e.exclude)
+}
+
+// IgnoreMatcher compiles the effective ignore rules for a node: the synced
+// .tendrilsignore at root, followed by this node's local patterns. Local rules
+// are appended last, so they win — they can hide more, or re-include a shared
+// ignored path with '!'. A missing ignore file contributes no rules; one that
+// exists but cannot be read is an error, never an empty rule set. Both the
+// engine and the daemonless status command call this, so the two cannot
+// disagree about which paths this node is responsible for.
+func IgnoreMatcher(root string, local []string) (*ignore.Matcher, error) {
+	var lines []string
+	data, err := os.ReadFile(filepath.Join(root, ignore.FileName))
+	switch {
+	case err == nil:
+		lines = strings.Split(string(data), "\n")
+	case !errors.Is(err, os.ErrNotExist):
+		return nil, fmt.Errorf("read ignore rules: %w", err)
 	}
-	return ignore.Compile(strings.Split(string(data), "\n"))
+	return ignore.Compile(append(lines, local...)), nil
 }
 
 // short trims a hex hash to a readable prefix for error messages.

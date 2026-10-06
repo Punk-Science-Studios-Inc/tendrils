@@ -193,3 +193,37 @@ func TestRetriesOnIndexPredatingTheBucket(t *testing.T) {
 		t.Errorf("writing to the new bucket: %v", err)
 	}
 }
+
+func TestMountsPersistAndReset(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "index.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddMounts([]string{"media", "backup/disk"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddMounts([]string{"media"}); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	got, err := s.Mounts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("mounts = %v, want two survivors of a reopen", got)
+	}
+	if err := s.ResetMounts(); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.Mounts(); len(got) != 0 {
+		t.Fatalf("mounts after reset = %v", got)
+	}
+}

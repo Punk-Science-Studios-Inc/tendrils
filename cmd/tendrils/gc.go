@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -26,6 +25,9 @@ func newGCCmd() *cobra.Command {
 		server          string
 		workers         int
 		maxInflightMB   int64
+		maxInspectMB    int64
+		snapshot        string
+		snapshotCheck   bool
 	)
 
 	cmd := &cobra.Command{
@@ -51,8 +53,14 @@ func newGCCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if len(cfg.Relays) == 0 {
+			if len(cfg.Relays) == 0 && snapshot == "" {
 				return fmt.Errorf("no relays configured: the keep-set comes from the relay, so gc cannot run without one")
+			}
+			if snapshot != "" && apply {
+				return fmt.Errorf("--snapshot is for reporting only; --apply requires a live, complete relay read")
+			}
+			if snapshotCheck && snapshot == "" {
+				return fmt.Errorf("--snapshot-check requires --snapshot")
 			}
 			if server == "" {
 				if len(cfg.BlossomServers) == 0 {
@@ -66,33 +74,39 @@ func newGCCmd() *cobra.Command {
 				return err
 			}
 
-			// The daemon holds the index lock, so this is a read the daemon must not
-			// be doing concurrently. Fail clearly rather than block.
-			idxPath, err := config.IndexPath()
-			if err != nil {
-				return err
-			}
-			if _, running, _ := queryDaemon(); running {
-				return fmt.Errorf("the daemon is running and holds the index; stop it first (systemctl --user stop tendrils-daemon) so gc can read the base")
-			}
-			// Read the base and let go of the index immediately. A sweep of a large
-			// store takes hours, and holding the lock for all of it would keep the
-			// daemon from syncing the whole time — for data it only needs at the
-			// start. Blobs the daemon uploads while the sweep runs are protected by
-			// the grace period, which is what that period is for.
-			base, err := readBase(idxPath)
-			if err != nil {
-				return err
-			}
-
 			ctx := cmd.Context()
-			relays := relay.New(cfg.Relays)
-			defer relays.Close()
-
-			fmt.Fprintln(out, "Fetching live file events from the relay…")
-			live, nEvents, nPaths, err := liveBlobsFromRelay(ctx, relays, id.PublicHex())
-			if err != nil {
-				return fmt.Errorf("fetch live events: %w (refusing to sweep on an incomplete view)", err)
+			var base map[string]*tree.Entry
+			var live map[string]struct{}
+			var nEvents, nPaths int
+			if snapshot != "" {
+				var captured time.Time
+				live, nEvents, nPaths, captured, err = liveBlobsFromSnapshot(snapshot, id.PublicHex(), time.Now())
+				if err != nil {
+					return err
+				}
+				fmt.Fprintf(out, "Relay LMDB snapshot captured %s (dry-run only)\n", captured.Format(time.RFC3339))
+			} else {
+				// The daemon holds the index lock, so a normal sweep needs it stopped.
+				// A snapshot report never deletes and uses the full relay DB itself as
+				// its keep-set, so it needs neither an index lock nor a daemon stop.
+				idxPath, err := config.IndexPath()
+				if err != nil {
+					return err
+				}
+				if _, running, _ := queryDaemon(); running {
+					return fmt.Errorf("the daemon is running and holds the index; stop it first so gc can read the base")
+				}
+				base, err = readBase(idxPath)
+				if err != nil {
+					return err
+				}
+				relays := relay.New(cfg.Relays)
+				defer relays.Close()
+				fmt.Fprintln(out, "Fetching live file events from the relay…")
+				live, nEvents, nPaths, err = liveBlobsFromRelay(ctx, relays, id.PublicHex())
+				if err != nil {
+					return fmt.Errorf("fetch live events: %w (refusing to sweep on an incomplete view)", err)
+				}
 			}
 			fmt.Fprintf(out, "Relay: %d events folded to %d current paths\n", nEvents, nPaths)
 
@@ -119,6 +133,9 @@ func newGCCmd() *cobra.Command {
 				}
 			}
 			fmt.Fprintf(out, "Keep-set: %d blobs (%d only in this device's index)\n", len(live), fromBase)
+			if snapshotCheck {
+				return nil
+			}
 
 			blobs := blob.New(server, id)
 			opts := gc.Options{
@@ -128,6 +145,7 @@ func newGCCmd() *cobra.Command {
 				SymKey:           symKey,
 				Workers:          workers,
 				MaxInFlightBytes: maxInflightMB << 20,
+				MaxInspectBytes:  maxInspectMB << 20,
 				Required:         required,
 			}
 			if trustReferences {
@@ -146,7 +164,7 @@ func newGCCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			printPlan(out, plan, apply)
+			printPlan(out, plan, apply, snapshot != "")
 			return nil
 		},
 	}
@@ -159,6 +177,10 @@ func newGCCmd() *cobra.Command {
 		"concurrent ownership checks (0 = default)")
 	cmd.Flags().Int64Var(&maxInflightMB, "max-inflight-mb", 0,
 		"ceiling on blob bytes held in memory at once; raise it on a large host (0 = default 256)")
+	cmd.Flags().Int64Var(&maxInspectMB, "max-inspect-mb", 0,
+		"skip blobs larger than this (0 = no limit); ownership proof holds ~2x the blob in memory")
+	cmd.Flags().StringVar(&snapshot, "snapshot", "", "complete local relay LMDB snapshot for a dry-run report (daemon may keep running)")
+	cmd.Flags().BoolVar(&snapshotCheck, "snapshot-check", false, "verify a snapshot and report its keep-set without listing or reading blobs")
 	return cmd
 }
 
@@ -187,9 +209,9 @@ func liveBlobsFromRelay(ctx context.Context, relays *relay.Client, pubkey string
 	}
 	current, skipped := engine.FoldRemote(evts)
 	if len(skipped) > 0 {
-		// Not fatal, but worth saying: an event we cannot read is not a licence to
-		// delete the blob it might describe.
-		fmt.Fprintf(os.Stderr, "warning: %d events could not be parsed and were ignored\n", len(skipped))
+		// A skipped event may be the only reference to a blob. GC must not treat
+		// a parse failure as evidence that its blobs are unreferenced.
+		return nil, 0, 0, fmt.Errorf("relay returned %d unparseable file events; first: %w", len(skipped), skipped[0])
 	}
 	entries := make([]*tree.Entry, 0, len(current))
 	for _, e := range current {
@@ -238,7 +260,7 @@ func blobAddresses(e *tree.Entry) []string {
 	return []string{e.BlobHash}
 }
 
-func printPlan(out io.Writer, p gc.Plan, applied bool) {
+func printPlan(out io.Writer, p gc.Plan, applied, snapshot bool) {
 	fmt.Fprintf(out, "Blobs on server:  %7d  %10s\n", p.TotalBlobs, humanBytes(p.TotalBytes))
 	fmt.Fprintf(out, "  referenced:     %7d  %10s\n", p.Kept, humanBytes(p.KeptBytes))
 	fmt.Fprintf(out, "  unreferenced:   %7d  %10s\n", p.Orphans, humanBytes(p.OrphanBytes))
@@ -249,6 +271,10 @@ func printPlan(out io.Writer, p gc.Plan, applied bool) {
 	if p.TooRecent > 0 {
 		fmt.Fprintf(out, "  too recent:     %7d  %10s  (inside the grace period, spared)\n",
 			p.TooRecent, humanBytes(p.TooRecentBytes))
+	}
+	if p.TooLarge > 0 {
+		fmt.Fprintf(out, "  too large:      %7d  %10s  (over the --max-inspect-mb cap, spared)\n",
+			p.TooLarge, humanBytes(p.TooLargeBytes))
 	}
 	if p.NotOurs > 0 {
 		fmt.Fprintf(out, "  not ours:       %7d  %10s  (did not decrypt under this key, left alone)\n",
@@ -268,7 +294,11 @@ func printPlan(out io.Writer, p gc.Plan, applied bool) {
 	} else {
 		fmt.Fprintf(out, "Would delete:     %7d  %10s reclaimable\n",
 			p.Orphans+p.Invalid, humanBytes(p.OrphanBytes+p.InvalidBytes))
-		fmt.Fprintln(out, "\nRe-run with --apply to delete.")
+		if snapshot {
+			fmt.Fprintln(out, "\nSnapshot reports cannot apply deletions; the live relay read must be complete for --apply.")
+		} else {
+			fmt.Fprintln(out, "\nRe-run with --apply to delete.")
+		}
 	}
 	if p.Failed > 0 {
 		fmt.Fprintf(out, "Failed:           %7d\n", p.Failed)

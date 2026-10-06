@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"ca.punkscience.tendrils/internal/keys"
+	"ca.punkscience.tendrils/internal/rootid"
 )
 
 const (
@@ -37,11 +38,25 @@ type Config struct {
 	// SyncRoot is the absolute path of the folder this device syncs. Each device
 	// may place it wherever it likes; identity is by relative path, not root.
 	SyncRoot string `json:"sync_root"`
+	// Root is the identity recorded when SyncRoot was enrolled or adopted: the
+	// ID in its marker file and its filesystem. Absent on enrollments from older
+	// builds, which must run `tendrils adopt` before the daemon will sync.
+	Root rootid.Identity `json:"root,omitzero"`
 	// Relays lists Nostr relay URLs. Empty means "discover from the key".
 	Relays []string `json:"relays,omitempty"`
 	// BlossomServers lists Blossom server URLs for blob storage. Empty means
 	// "discover from the key".
 	BlossomServers []string `json:"blossom_servers,omitempty"`
+	// Exclude lists gitignore-style patterns for paths this device does NOT
+	// sync. It is per-node and never published: unlike the synced
+	// .tendrilsignore at the sync root, it lets one device opt out of a subtree
+	// (say, a large music folder) while every other device keeps syncing it. An
+	// excluded path is invisible to reconcile here — never pulled, published,
+	// trashed or tombstoned — so a local copy can be deleted to reclaim space
+	// and will not return. Syntax is that of internal/ignore. Patterns are
+	// applied after the .tendrilsignore rules, so they win, and a `!` pattern
+	// can re-include a path the shared file ignores.
+	Exclude []string `json:"exclude,omitempty"`
 	// UpdateCheck enables the background check for a newer release. A pointer so
 	// that absent means "the default", and Save round-trips a config that never
 	// set it instead of writing an opinion the owner did not express.

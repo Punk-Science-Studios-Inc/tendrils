@@ -108,6 +108,14 @@ type Options struct {
 	// a 1.8 GB host is what took the machine down. Counting bytes makes the ceiling
 	// hold whatever the draw.
 	MaxInFlightBytes int64
+	// MaxInspectBytes refuses to inspect (and therefore delete) any blob larger
+	// than this. Proving ownership means holding the whole sealed blob and, for a
+	// successful open, its plaintext too — roughly twice the blob's size at peak.
+	// On a host with little RAM the largest blobs in a store are exactly the ones
+	// a sweep cannot safely touch; without this cap the sweep allocates ~2× the
+	// biggest blob and is OOM-killed, taking the host's other services with it.
+	// Such blobs are counted in Plan.TooLarge and left in place. Zero means no cap.
+	MaxInspectBytes int64
 }
 
 // Plan is what a sweep found, and what it did if Apply was set.
@@ -130,6 +138,11 @@ type Plan struct {
 	// Unreferenced but not provably ours, so left alone.
 	NotOurs      int
 	NotOursBytes int64
+	// Unreferenced, but larger than the host is willing to inspect, so left alone.
+	// Nothing is wrong with them; the sweep simply cannot prove ownership without
+	// more memory than it has. See Options.MaxInspectBytes.
+	TooLarge      int
+	TooLargeBytes int64
 	// Missing counts keep-set blobs the store does not hold. A sweep never causes
 	// this — it only deletes what the keep-set excludes — but the sweep is the one
 	// moment the two sets are compared, so it is the natural place to notice.
@@ -212,6 +225,14 @@ func Sweep(ctx context.Context, store Store, pubkey string, live map[string]stru
 		if time.Unix(b.Uploaded, 0).After(cutoff) {
 			plan.TooRecent++
 			plan.TooRecentBytes += b.Size
+			continue
+		}
+		if opts.MaxInspectBytes > 0 && b.Size > opts.MaxInspectBytes {
+			// Ownership proof needs the sealed blob and its plaintext in memory at
+			// once. Refusing here is the difference between leaving a big orphan
+			// behind and taking the host down proving it is one.
+			plan.TooLarge++
+			plan.TooLargeBytes += b.Size
 			continue
 		}
 		candidates = append(candidates, b)

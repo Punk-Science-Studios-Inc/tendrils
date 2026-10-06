@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -41,6 +42,12 @@ func newDaemonCmd() *cobra.Command {
 			}
 			if cfg.SyncRoot == "" {
 				return fmt.Errorf("no sync root set: run 'tendrils enroll --root <folder>'")
+			}
+			// An enrollment from before root identities has nothing to check the
+			// folder against. Adopting it is a one-time, explicit act: guessing
+			// would adopt an empty mountpoint as readily as the real folder.
+			if cfg.Root.IsZero() {
+				return fmt.Errorf("the sync root %s has no recorded identity: stop any other tendrils process, then run 'tendrils adopt' once to verify and adopt it", cfg.SyncRoot)
 			}
 			// Relays still can't be discovered (NIP-65 is a later milestone), but
 			// the Blossom server can: a device enrolled with only --key + --relay
@@ -82,10 +89,14 @@ func newDaemonCmd() *cobra.Command {
 			// large files skip the proxy's request-size cap, while a device that
 			// leaves that network keeps syncing by falling through to the next.
 			blobs := blob.NewPool(cfg.BlossomServers, id)
-			eng, err := engine.New(cfg.SyncRoot, id, idx, blobs, relays, log)
+			eng, err := engine.New(cfg.SyncRoot, cfg.Root, id, idx, blobs, relays, log)
 			if err != nil {
 				return err
 			}
+			// This node's own opt-outs. The synced .tendrilsignore is read by the
+			// engine each pass; these come from config.json and are what let one
+			// device drop a subtree the rest of the set keeps syncing.
+			eng.SetExclude(cfg.Exclude)
 
 			// The daemon holds the index lock for its whole life, so it is the
 			// only process that can read the base — expose a loopback endpoint so
@@ -111,9 +122,12 @@ func newDaemonCmd() *cobra.Command {
 				fmt.Fprintln(out, "  Update:   ", summary)
 			}
 			fmt.Fprintln(out, "  Identity: ", npub)
-			fmt.Fprintln(out, "  Sync root:", cfg.SyncRoot)
+			fmt.Fprintln(out, "  Sync root:", cfg.SyncRoot, "(id "+cfg.Root.ID+")")
 			fmt.Fprintln(out, "  Relays:   ", cfg.Relays)
 			fmt.Fprintln(out, "  Storage:  ", cfg.BlossomServers)
+			if len(cfg.Exclude) > 0 {
+				fmt.Fprintln(out, "  Exclude:  ", cfg.Exclude, "(this device only)")
+			}
 			fmt.Fprintln(out, "  Interval: ", interval)
 			fmt.Fprintln(out)
 
@@ -186,9 +200,13 @@ func runLoop(ctx context.Context, eng *engine.Engine, interval time.Duration, lo
 		state.begin()
 		err := eng.Sync(ctx)
 		state.end(err)
-		if err != nil {
+		var paused *engine.Paused
+		switch {
+		case errors.As(err, &paused):
+			log.Warn("sync paused", "reason", paused.Cause)
+		case err != nil:
 			log.Error("reconcile pass failed", "err", err)
-		} else {
+		default:
 			log.Info("reconcile pass complete")
 		}
 	}

@@ -13,9 +13,21 @@ Read the ordering section before starting. Nothing here is destructive except
 On a device that already has Tendrils installed:
 
 ```sh
+systemctl --user stop tendrils-daemon.service
 tendrils upgrade                 # verify and replace both binaries
-systemctl --user restart tendrils-daemon.service
+tendrils adopt                   # once, on devices enrolled before root identities
+systemctl --user start tendrils-daemon.service
 ```
+
+**Root adoption (once per device).** Builds from this one on refuse to sync a
+folder they cannot identify, because an unmounted drive leaves an empty
+mountpoint behind, and that looks exactly like every file having been deleted.
+A device enrolled by an older build has no identity recorded, so its daemon
+exits with *"has no recorded identity … run 'tendrils adopt'"* until you adopt
+the folder. `adopt` needs the daemon stopped (it uses the index). It refuses a
+folder holding none of the files last synced there, and it never deletes
+anything. This is local only: the wire format does not change, and an
+un-upgraded device works alongside an upgraded one.
 
 `tendrils upgrade` downloads the release archive for this platform, verifies it
 against the release's `checksums.txt`, **runs the new binary and asks it its
@@ -255,8 +267,10 @@ journalctl --user -u tendrils-blossom.service -n 2 --no-pager
 **Linux / macOS**
 
 ```sh
+systemctl --user stop tendrils-daemon.service
 tendrils upgrade                                     # on a device that already has it
-systemctl --user restart tendrils-daemon.service
+tendrils adopt                                       # once, if enrolled by an older build
+systemctl --user start tendrils-daemon.service
 ```
 
 or, to bootstrap a machine that does not:
@@ -274,6 +288,9 @@ irm https://raw.githubusercontent.com/Punk-Science-Studios-Inc/tendrils/main/ins
 
 Then restart the daemon however it is registered — see the `install-windows`
 skill in this repo if it runs as a scheduled task or startup launcher.
+
+On any device enrolled by an older build, run `tendrils adopt` once with the
+daemon stopped, before starting it again.
 
 **From a working copy**
 
@@ -376,6 +393,47 @@ systemctl --user start tendrils-daemon.service
 `gc` needs the relay (the keep-set comes from it) and the daemon stopped (it
 holds the index lock). It releases the lock immediately after reading the base,
 so the daemon can be restarted while a long sweep continues.
+
+If the relay cannot return a complete history because more than one query's
+limit of events share a timestamp, export the relay's LMDB store on its host and
+use the read-only snapshot mode. The exporter holds one LMDB read transaction,
+walks every raw event, and retains the current event for each path using the
+same `created_at` and event-ID tie break as the sync engine:
+
+```sh
+python3 tools/relay_snapshot.py --db ~/.nostr-relay/db \
+  --pubkey YOUR_PUBLIC_KEY --output /tmp/tendrils-relay-snapshot.json
+# Copy the JSON to an enrolled device with enough RAM to inspect blobs.
+tendrils gc --snapshot /tmp/tendrils-relay-snapshot.json --snapshot-check
+tendrils gc --snapshot /tmp/tendrils-relay-snapshot.json --server http://YOUR_SERVER:8091
+```
+
+The snapshot must be less than 30 minutes old when the command starts. The
+command checks its identity, counts, event IDs and signatures. Snapshot mode
+is **report-only** and can run while the daemon holds the index. It never
+accepts `--apply`; deletions require a complete live relay read. Keep the
+default 48-hour grace so uploads made after the snapshot are spared. Leave
+ownership checks enabled when the Blossom store serves more than one identity.
+
+For a large store on a slow link, run the byte scan on the Blossom host instead
+of pulling every candidate over the network. First validate the snapshot with
+`--snapshot-check`, copy it to the server, and confirm the two `sha256sum`
+values match. Then run the local streaming report with the keep-set count printed
+by `--snapshot-check`:
+
+```sh
+python3 tools/blossom_local_report.py \
+  --snapshot /tmp/tendrils-relay-snapshot.json \
+  --expected-keep-count 14431 \
+  --blob-dir /path/from/BLOSSOM_DIR \
+  --key-file ~/.config/tendrils/key
+```
+
+This needs Python's `cryptography` package on the Blossom host. It verifies each
+candidate's content address and AES-GCM tag in 1 MiB blocks, and reports any
+read failure as an incomplete result. It never writes to the blob store. The
+script trusts the snapshot only after the Go `--snapshot-check` and checksum
+comparison; do not edit the snapshot between those steps.
 
 Read the dry run before applying. Sanity check: **`referenced` bytes should be
 close to the size of your synced tree.** If it is wildly smaller, stop — the
