@@ -139,6 +139,26 @@ settings.local.json
 
 Ignored paths are *frozen*, not deleted: anything already synced stays in place but stops syncing.
 
+### Excluding a folder on just one device
+
+`.tendrilsignore` rules are shared because the file is synced. To opt a **single**
+device out of a subtree — say, a small box that cannot hold your music library —
+use `tendrils exclude`:
+
+```sh
+tendrils exclude add 'music/'      # this device only; other devices unaffected
+tendrils exclude list
+tendrils exclude remove 'music/'
+```
+
+Patterns use the same syntax as `.tendrilsignore` and live in this device's
+`config.json`, never published. An excluded path is invisible here: never pulled,
+published, trashed or tombstoned. And, as with ignore, an existing local copy is
+**frozen, not deleted** — so to actually reclaim the space, exclude the folder
+and then delete it locally. That deletion is invisible too: it will not propagate
+to other devices and the folder will not be pulled back. Restart the daemon after
+changing the list.
+
 ## How it works
 
 | Piece | Role |

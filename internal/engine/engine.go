@@ -85,6 +85,10 @@ type Engine struct {
 	report      func(Progress)
 	statsReport func(Stats)
 	chunkSize   int64
+	// exclude is this node's own ignore patterns, from config.json. They are
+	// applied after the synced .tendrilsignore, so a device can hide a subtree
+	// from itself without changing what any other device syncs.
+	exclude []string
 }
 
 // OnProgress registers a callback invoked as each planned action begins and once
@@ -117,6 +121,14 @@ func (e *Engine) reportStats(s Stats) {
 		e.statsReport(s)
 	}
 }
+
+// SetExclude supplies this node's per-device ignore patterns (config.json's
+// "exclude"). They are compiled alongside the synced .tendrilsignore on every
+// pass, so a change takes effect without rebuilding the engine. A path either
+// set ignores is invisible to reconcile — never pulled, published, trashed or
+// tombstoned — which is what lets a node drop a subtree locally while every
+// other node keeps syncing it. Call before Sync; not safe to call concurrently.
+func (e *Engine) SetExclude(patterns []string) { e.exclude = patterns }
 
 // plannedAction is one path the reconciler decided needs work, captured up front
 // so the pass knows its total before executing (that count is what "3 of 12" needs).
@@ -770,11 +782,21 @@ func (e *Engine) abs(relSlash string) string {
 // loadIgnore reads the sync root's .tendrilsignore into a matcher. A missing or
 // unreadable file yields an empty matcher (nothing ignored).
 func (e *Engine) loadIgnore() *ignore.Matcher {
-	data, err := os.ReadFile(filepath.Join(e.root, ignore.FileName))
-	if err != nil {
-		return ignore.Compile(nil)
+	return IgnoreMatcher(e.root, e.exclude)
+}
+
+// IgnoreMatcher compiles the effective ignore rules for a node: the synced
+// .tendrilsignore at root, followed by this node's local patterns. Local rules
+// are appended last, so they win — they can hide more, or re-include a shared
+// ignored path with '!'. A missing ignore file contributes no rules. Both the
+// engine and the daemonless status command call this, so the two cannot
+// disagree about which paths this node is responsible for.
+func IgnoreMatcher(root string, local []string) *ignore.Matcher {
+	var lines []string
+	if data, err := os.ReadFile(filepath.Join(root, ignore.FileName)); err == nil {
+		lines = strings.Split(string(data), "\n")
 	}
-	return ignore.Compile(strings.Split(string(data), "\n"))
+	return ignore.Compile(append(lines, local...))
 }
 
 // short trims a hex hash to a readable prefix for error messages.

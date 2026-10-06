@@ -76,7 +76,7 @@ func localSnapshot(id *keys.Identity) (statusSnapshot, error) {
 	}
 	defer store.Close()
 
-	last, stats, err := computeStatus(store, cfg.SyncRoot)
+	last, stats, err := computeStatus(store, cfg.SyncRoot, cfg.Exclude)
 	if err != nil {
 		return snap, err
 	}
@@ -93,7 +93,11 @@ func localSnapshot(id *keys.Identity) (statusSnapshot, error) {
 // many conflict copies await the owner, and how many paths are waiting out a
 // retry backoff. Its reads are safe to run concurrently with the engine's writes
 // on the same index handle.
-func computeStatus(store *index.Store, root string) (last time.Time, stats engine.Stats, err error) {
+//
+// It applies the same ignore rules the engine does (shared .tendrilsignore plus
+// this node's "exclude" patterns), so a path this node has opted out of and
+// deleted does not read as a forever-pending local deletion.
+func computeStatus(store *index.Store, root string, exclude []string) (last time.Time, stats engine.Stats, err error) {
 	last, err = store.LastReconcile()
 	if err != nil {
 		return
@@ -119,8 +123,12 @@ func computeStatus(store *index.Store, root string) (last time.Time, stats engin
 	if err != nil {
 		return
 	}
+	ign := engine.IgnoreMatcher(root, exclude)
 
 	for path, e := range local {
+		if ign.Match(path) {
+			continue // invisible to this node; neither pending nor a conflict
+		}
 		if scan.IsConflictCopy(path) {
 			stats.Conflicts++
 			continue
@@ -130,7 +138,7 @@ func computeStatus(store *index.Store, root string) (last time.Time, stats engin
 		}
 	}
 	for path, b := range base {
-		if !b.Live() {
+		if !b.Live() || ign.Match(path) {
 			continue
 		}
 		if _, stillHere := local[path]; !stillHere {

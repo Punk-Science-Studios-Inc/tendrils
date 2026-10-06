@@ -91,7 +91,9 @@ and pull what's missing.** Bootstrap is just reconcile-from-empty.
 - Multiple / independent synced folders.
 - Line-level merge (mtime last-writer-wins is enough).
 - Mirror / multi-server redundancy.
-- Selective / partial sync and advanced ignore rules.
+- Selective / partial sync **is built** (`tendrils exclude` — per-node
+  opt-outs; see README and AGENTS.md). Still deferred: ignore rules beyond the
+  `.tendrilsignore` subset.
 
 ## What's ready to build
 

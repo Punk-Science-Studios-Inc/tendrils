@@ -730,3 +730,120 @@ func TestFoldRemoteIsOrderIndependentAcrossIdenticalRepublishes(t *testing.T) {
 		}
 	}
 }
+
+// A per-device exclude (config.json's "exclude") is invisible to this node the
+// same way a shared .tendrilsignore rule is: a remote-only path is not pulled.
+// Unlike the shared file, it changes nothing for any other device.
+func TestLocalExcludeDoesNotPullRemote(t *testing.T) {
+	id := mustID(t)
+	ev, bl := newFakeEvents(), newFakeBlobs()
+	seedRemote(t, ev, bl, id, "music/song.flac", "audio", time.Unix(1_700_000_050, 0))
+	seedRemote(t, ev, bl, id, "notes/a.md", "note", time.Unix(1_700_000_050, 0))
+
+	root := t.TempDir()
+	eng := newEngine(t, root, id, ev, bl)
+	eng.SetExclude([]string{"music/"})
+	if err := eng.Sync(context.Background()); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+
+	if _, ok := readFile(t, root, "music/song.flac"); ok {
+		t.Errorf("excluded remote file was pulled locally")
+	}
+	if got, ok := readFile(t, root, "notes/a.md"); !ok || got != "note" {
+		t.Errorf("non-excluded remote file = %q present=%v, want it pulled", got, ok)
+	}
+}
+
+// An excluded path that this node had already synced and then deleted must not
+// be tombstoned (that would delete it for the rest of the set) and must not be
+// pulled back. The local copy is simply gone, which is the point of excluding it.
+func TestLocalExcludeDoesNotTombstone(t *testing.T) {
+	id := mustID(t)
+	ev, bl := newFakeEvents(), newFakeBlobs()
+
+	root := t.TempDir()
+	writeFile(t, root, "music/song.flac", "audio", time.Unix(1_700_000_000, 0))
+	writeFile(t, root, "keep.md", "note", time.Unix(1_700_000_000, 0))
+
+	eng := newEngine(t, root, id, ev, bl)
+	if err := eng.Sync(context.Background()); err != nil { // publishes both
+		t.Fatalf("first sync: %v", err)
+	}
+
+	eng.SetExclude([]string{"music/"})
+	if err := os.Remove(filepath.Join(root, "music", "song.flac")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.Sync(context.Background()); err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+
+	got, _, err := ev.Fetch(context.Background(), id.PublicHex())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range got {
+		ent, err := nostrevent.Parse(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ent.Path == "music/song.flac" && !ent.Live() {
+			t.Errorf("excluded path was tombstoned, which would delete it for every device")
+		}
+	}
+	if _, ok := readFile(t, root, "music/song.flac"); ok {
+		t.Errorf("excluded path was pulled back after being deleted")
+	}
+}
+
+// Local patterns are applied after the shared .tendrilsignore, so they can also
+// re-include (with '!') a path the shared file hides.
+func TestLocalExcludeCanReincludeSharedIgnore(t *testing.T) {
+	id := mustID(t)
+	ev, bl := newFakeEvents(), newFakeBlobs()
+
+	root := t.TempDir()
+	writeFile(t, root, ".tendrilsignore", "*.secret\n", time.Unix(1_700_000_000, 0))
+	writeFile(t, root, "a.secret", "shared-ignored", time.Unix(1_700_000_000, 0))
+	writeFile(t, root, "keep.secret", "locally re-included", time.Unix(1_700_000_000, 0))
+
+	eng := newEngine(t, root, id, ev, bl)
+	eng.SetExclude([]string{"!keep.secret"})
+	if err := eng.Sync(context.Background()); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+
+	got, _, err := ev.Fetch(context.Background(), id.PublicHex())
+	if err != nil {
+		t.Fatal(err)
+	}
+	published := map[string]bool{}
+	for _, e := range got {
+		ent, err := nostrevent.Parse(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		published[ent.Path] = true
+	}
+	if published["a.secret"] {
+		t.Errorf("shared-ignored file was published")
+	}
+	if !published["keep.secret"] {
+		t.Errorf("locally re-included file was not published")
+	}
+}
+
+// A missing .tendrilsignore is not an error: local patterns still apply.
+func TestIgnoreMatcherWithoutSharedFile(t *testing.T) {
+	m := IgnoreMatcher(t.TempDir(), []string{"music/"})
+	if m == nil {
+		t.Fatal("IgnoreMatcher returned nil")
+	}
+	if !m.Match("music/a.flac") {
+		t.Errorf("local pattern did not match without a shared ignore file")
+	}
+	if m.Match("notes/a.md") {
+		t.Errorf("unrelated path matched")
+	}
+}

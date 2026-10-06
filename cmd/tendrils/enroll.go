@@ -13,7 +13,7 @@ import (
 
 func newEnrollCmd() *cobra.Command {
 	var keyArg, rootArg string
-	var relays, blossom []string
+	var relays, blossom, exclude []string
 
 	cmd := &cobra.Command{
 		Use:   "enroll",
@@ -52,6 +52,9 @@ func newEnrollCmd() *cobra.Command {
 			if len(blossom) > 0 {
 				cfg.BlossomServers = blossom
 			}
+			if len(exclude) > 0 {
+				cfg.Exclude = exclude
+			}
 			if err := config.Save(cfg); err != nil {
 				return err
 			}
@@ -76,6 +79,7 @@ func newEnrollCmd() *cobra.Command {
 	cmd.Flags().StringVar(&rootArg, "root", "", "local folder to sync (the sync root)")
 	cmd.Flags().StringSliceVar(&relays, "relay", nil, "relay URL override (repeatable); default is discovery")
 	cmd.Flags().StringSliceVar(&blossom, "blossom", nil, "Blossom server URL override (repeatable)")
+	cmd.Flags().StringSliceVar(&exclude, "exclude", nil, "path pattern this device should not sync (repeatable), e.g. music/ or *.iso")
 	return cmd
 }
 

@@ -752,3 +752,36 @@ func TestSweepRespectsMemoryCeiling(t *testing.T) {
 		t.Errorf("deleted = %d, want %d", plan.Deleted, total)
 	}
 }
+
+// A host that cannot hold the biggest blob cannot prove ownership of it, and
+// must not try: ownership proof keeps the sealed blob and its plaintext in
+// memory at once, ~2x the blob. Over the cap, the blob is spared and reported,
+// and every smaller orphan is still swept — so a small host reclaims everything
+// it can instead of dying on the one blob it cannot.
+func TestBlobsTooLargeToInspectAreSpared(t *testing.T) {
+	key := mustKey(t)
+	st := newFakeStore()
+
+	bigAddr, big := seal(t, key, strings.Repeat("x", 4096))
+	st.put(bigAddr, big, old)
+	smallAddr, small := seal(t, key, "tiny")
+	st.put(smallAddr, small, old)
+
+	plan, err := Sweep(context.Background(), st, "pub", map[string]struct{}{}, 0,
+		Options{Apply: true, SymKey: key, Now: now, MaxInspectBytes: 1024})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.TooLarge != 1 || plan.TooLargeBytes != int64(len(big)) {
+		t.Errorf("tooLarge = %d (%d bytes), want 1 (%d)", plan.TooLarge, plan.TooLargeBytes, len(big))
+	}
+	if plan.Deleted != 1 || plan.Orphans != 1 {
+		t.Errorf("deleted = %d, orphans = %d, want 1 each (the small blob)", plan.Deleted, plan.Orphans)
+	}
+	if _, still := st.blobs[bigAddr]; !still {
+		t.Error("the oversized blob was deleted despite the cap")
+	}
+	if _, still := st.blobs[smallAddr]; still {
+		t.Error("the small orphan survived")
+	}
+}

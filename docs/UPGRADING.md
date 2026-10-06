@@ -377,6 +377,47 @@ systemctl --user start tendrils-daemon.service
 holds the index lock). It releases the lock immediately after reading the base,
 so the daemon can be restarted while a long sweep continues.
 
+If the relay cannot return a complete history because more than one query's
+limit of events share a timestamp, export the relay's LMDB store on its host and
+use the read-only snapshot mode. The exporter holds one LMDB read transaction,
+walks every raw event, and retains the current event for each path using the
+same `created_at` and event-ID tie break as the sync engine:
+
+```sh
+python3 tools/relay_snapshot.py --db ~/.nostr-relay/db \
+  --pubkey YOUR_PUBLIC_KEY --output /tmp/tendrils-relay-snapshot.json
+# Copy the JSON to an enrolled device with enough RAM to inspect blobs.
+tendrils gc --snapshot /tmp/tendrils-relay-snapshot.json --snapshot-check
+tendrils gc --snapshot /tmp/tendrils-relay-snapshot.json --server http://YOUR_SERVER:8091
+```
+
+The snapshot must be less than 30 minutes old when the command starts. The
+command checks its identity, counts, event IDs and signatures. Snapshot mode
+is **report-only** and can run while the daemon holds the index. It never
+accepts `--apply`; deletions require a complete live relay read. Keep the
+default 48-hour grace so uploads made after the snapshot are spared. Leave
+ownership checks enabled when the Blossom store serves more than one identity.
+
+For a large store on a slow link, run the byte scan on the Blossom host instead
+of pulling every candidate over the network. First validate the snapshot with
+`--snapshot-check`, copy it to the server, and confirm the two `sha256sum`
+values match. Then run the local streaming report with the keep-set count printed
+by `--snapshot-check`:
+
+```sh
+python3 tools/blossom_local_report.py \
+  --snapshot /tmp/tendrils-relay-snapshot.json \
+  --expected-keep-count 14431 \
+  --blob-dir /path/from/BLOSSOM_DIR \
+  --key-file ~/.config/tendrils/key
+```
+
+This needs Python's `cryptography` package on the Blossom host. It verifies each
+candidate's content address and AES-GCM tag in 1 MiB blocks, and reports any
+read failure as an incomplete result. It never writes to the blob store. The
+script trusts the snapshot only after the Go `--snapshot-check` and checksum
+comparison; do not edit the snapshot between those steps.
+
 Read the dry run before applying. Sanity check: **`referenced` bytes should be
 close to the size of your synced tree.** If it is wildly smaller, stop — the
 keep-set is wrong and applying would delete live data.

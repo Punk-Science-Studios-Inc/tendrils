@@ -86,6 +86,10 @@ func newDaemonCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// This node's own opt-outs. The synced .tendrilsignore is read by the
+			// engine each pass; these come from config.json and are what let one
+			// device drop a subtree the rest of the set keeps syncing.
+			eng.SetExclude(cfg.Exclude)
 
 			// The daemon holds the index lock for its whole life, so it is the
 			// only process that can read the base — expose a loopback endpoint so
@@ -114,6 +118,9 @@ func newDaemonCmd() *cobra.Command {
 			fmt.Fprintln(out, "  Sync root:", cfg.SyncRoot)
 			fmt.Fprintln(out, "  Relays:   ", cfg.Relays)
 			fmt.Fprintln(out, "  Storage:  ", cfg.BlossomServers)
+			if len(cfg.Exclude) > 0 {
+				fmt.Fprintln(out, "  Exclude:  ", cfg.Exclude, "(this device only)")
+			}
 			fmt.Fprintln(out, "  Interval: ", interval)
 			fmt.Fprintln(out)
 

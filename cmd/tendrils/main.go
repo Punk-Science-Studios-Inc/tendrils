@@ -52,6 +52,7 @@ func newRootCmd() *cobra.Command {
 		newKeygenCmd(),
 		newEnrollCmd(),
 		newStatusCmd(),
+		newExcludeCmd(),
 		newDaemonCmd(),
 		newGCCmd(),
 		newRepairCmd(),

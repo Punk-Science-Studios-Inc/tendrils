@@ -22,8 +22,9 @@ Built and tested (`go test ./...` green):
 | `internal/reconcile` | The pure conflict decision: LWW-by-mtime, delete-is-absolute, re-creation-honoured, conflict copies. Delete-is-absolute now includes **tombstone re-assertion**: a base tombstone facing a live remote entry no newer than it republishes the tombstone rather than pulling the file back, so a concurrent edit that displaced the delete on the relay cannot resurrect it. One test per Gherkin scenario. **The correctness-critical heart.** |
 | `internal/index` | bbolt store of the last-synced `Entry` per path (the reconcile "base") + last-reconcile time. Retains tombstones. Also holds per-path **`Retry`** state (failure count, next-attempt time, cause, permanent flag) in its own bucket — created on open, so an index from an older build upgrades in place. |
 | `internal/scan` | Walk the sync root → `Entry` map (sha256, mtime); skips `.tendrils-trash`; conflict-copy naming (`ConflictMarker`). |
+| `internal/ignore` | gitignore-style matcher (`.tendrilsignore` subset: `#`, `!`, trailing `/`, anchored, `* ? **`). Used for both the **shared** synced ignore file and each node's **local** `exclude` patterns — see "Per-node exclusions" below. |
 | `internal/nostrevent` | `Entry` ⇄ Nostr event codec. Parameterized replaceable event, kind `31337`, `d`=path, `x`=sha256, `mtime`/`deleted` tags. **`created_at` = publication time, not mtime** — see "Two clocks" below. Signs/verifies. |
-| `internal/config` | State dir (`$TENDRILS_HOME` or OS config dir), local `config.json` (overrides discovery), device key at rest (0600 file — deliberately not a keychain). |
+| `internal/config` | State dir (`$TENDRILS_HOME` or OS config dir), local `config.json` (overrides discovery, plus the per-node **`exclude`** patterns), device key at rest (0600 file — deliberately not a keychain). |
 | `internal/blob` | Blossom (BUD-01/02) client: `Upload`/`Download`/`Has` opaque bytes addressed by sha256, with a signed per-request kind-24242 auth event. Verifies content addresses locally on both directions. Pure transport — no knowledge of encryption or plaintext hashes. A 413 is typed as **`ErrTooLarge`** so the engine can tell "retrying cannot fix this" from a transient failure; error bodies are collapsed and truncated, and a proxy's HTML error page is dropped entirely (quoting one per rejected file is what made the daemon log unreadable). |
 | `internal/tree` `internal/nostrevent` | `Entry` carries `BlobHash` (sealed-blob Blossom address) alongside `Sha256` (plaintext identity); the event codec round-trips it in a `blob` tag. |
 | `internal/engine` | Orchestrates one full `Sync` reconcile pass: scan → read index base → fetch relay truth → `reconcile.Decide` per path → execute (seal+upload+publish / pull+unseal+atomic-write / trash / publish-tombstone). Network deps are `EventStore`/`BlobStore` interfaces (`*blob.Client` satisfies `BlobStore`), so it runs headless. Tested end-to-end with in-memory fakes: publish, pull, two-device convergence, delete propagation to trash, and conflict-copy preservation. One `Sync` is also the bootstrap and the periodic reconcile. **`publishLocal` hashes the bytes it actually read and uploaded**, never the scan's — see "Publish the hash you uploaded" below. Per-path **retry backoff** (`backoff.go`) holds repeatedly-failing paths back instead of retrying them every pass. A pass acts on the relay's *absence* of a path only when the fetch reported itself complete (`withheldByPartialView`), and `FoldRemote` collapses retained replaceable events by **`created_at`**, the relay's own rule — see "A read that failed is not an empty set" below. |
@@ -32,12 +33,42 @@ Built and tested (`go test ./...` green):
 | `internal/gc` | Orphan blob reclamation: folds the relay's current truth into a keep-set, classifies every stored blob (kept / unreferenced / invalid / too-recent / not-ours), and deletes only what it can justify. Dry-run by default. See "Blob GC" below — it is the one operation syncing cannot undo. |
 | `internal/buildinfo` | Which build is running. Release builds stamp version/commit/date via `-ldflags -X`; everything else falls back to the toolchain's embedded module and VCS data, so a source build still reports a real commit and a dirty flag. Both binaries take the same stamp. |
 | `internal/selfupdate` | Finding, verifying and installing a newer release. Queries the public GitHub releases API (endpoint is a field, so tests drive it from an `httptest.Server`), compares semver, streams the archive to a staging dir **inside the destination**, verifies it against the release's `checksums.txt`, **execs the new binary and checks the version it reports**, then renames it into place. Caches the check in `update.json` (24 h; failures back off 15 m → 6 h). Also `Boundary`, the coordinated-upgrade gate fed by the release's `release.json`. No token, no credentials, no cgo. |
-| `cmd/tendrils` | **cobra** CLI: `keygen`, `enroll` (`--key`/`--root`, reuses stored key), `status` (pending/conflicts/**stuck** from scan-vs-index), `daemon` (builds the engine from config and runs a periodic reconcile loop; `--interval`, graceful shutdown on Ctrl-C), `gc` (reclaim orphaned blobs; `--apply` to delete), `upgrade` (`--check`/`--version`/`--force`/`--yes`), `version`. Root sets `cobra.Command.Version`, so `--version`/`-v` work too, and its `PersistentPostRun` prints the cached update notice and schedules the next background check. |
+| `cmd/tendrils` | **cobra** CLI: `keygen`, `enroll` (`--key`/`--root`/`--exclude`, reuses stored key), `status` (pending/conflicts/**stuck** from scan-vs-index), `exclude` (`list`/`add`/`remove` this device's local opt-outs), `daemon` (builds the engine from config and runs a periodic reconcile loop; `--interval`, graceful shutdown on Ctrl-C), `gc` (reclaim orphaned blobs; `--apply` to delete), `upgrade` (`--check`/`--version`/`--force`/`--yes`), `version`. Root sets `cobra.Command.Version`, so `--version`/`-v` work too, and its `PersistentPostRun` prints the cached update notice and schedules the next background check. |
 
 Not yet built (next milestones): **relay** discovery (NIP-65/kind-10002 — until then `daemon` still requires `--relay` set at enroll; Blossom-server discovery via kind-10063 **is** built, so `--blossom` is optional on later devices), fsnotify watch (with debounce/settle, to complement the periodic reconcile), Blossom multi-server mirroring (daemon uses the first server — which is also why a file too large for that one server simply cannot sync, however many are configured), and the tray. (Blossom **orphan GC** is now built — see "Blob GC" below.)
 
-## Publish the hash you uploaded
+## Per-node exclusions (selective sync)
 
+There are two ignore sources, and the difference between them is the whole point:
+
+- **`.tendrilsignore`** at the sync root is itself synced. One edit applies to
+  every device — the rules are shared.
+- **`"exclude"`** in `config.json` is per-node and never published. It lets one
+  device opt out of a subtree while every other device keeps syncing it — e.g. a
+  Raspberry Pi that cannot hold a 188 GB music folder still syncs the rest of the
+  vault, and the music is unaffected everywhere else.
+
+`tendrils exclude add music/` / `list` / `remove` edits the local list (or set it
+at enrollment with `enroll --exclude`, or edit `config.json` directly). The engine
+compiles the shared file's lines and then the node's patterns into one matcher
+(`engine.IgnoreMatcher`), so the node's rules are applied last and win — they can
+hide more, or re-include a shared-ignored path with `!`. A path either matcher
+ignores is invisible to `reconcile`: **never pulled, published, trashed or
+tombstoned**, and any local copy is left frozen in place.
+
+That last property is both the feature and the trap. Excluding a path does
+**not** delete an already-synced local copy. To reclaim the space you exclude,
+then delete the local folder — that deletion is invisible too, so it neither
+tombstones the path for the rest of the set nor comes back. The index base still
+records those paths, which is harmless: GC unions the base into its keep-set, and
+the relay still references the blobs from the devices that kept syncing them.
+
+`status` applies the same matcher in its daemonless path, so an excluded-then-
+deleted path does not read as forever-pending. A change to `exclude` needs a
+daemon restart (patterns are captured at startup, though the matcher is compiled
+per pass); a change to `.tendrilsignore` does not.
+
+## Publish the hash you uploaded
 `publishLocal` reads the file, seals it, uploads it, and publishes an event describing it. The `Sha256` in that event must be the hash of **the bytes it just read** — never `local.Sha256` from the scan earlier in the same pass.
 
 A file rewritten in between (a tag editor, a copy still running) otherwise gets published as "these bytes, under the old hash": the blob is fine, the hash beside it is not, and the two do not agree. Nothing can consume that event. Every puller downloads the blob, decrypts it successfully, fails `hashHex(plaintext) != remote.Sha256`, and rejects it — forever, since the reconciler keeps choosing to pull. This shipped as a real bug (the comment said "re-hash from the bytes we just read"; the code did not) and poisoned one path in the author's tree for ten hours until the publishing device came back and republished.
@@ -184,7 +215,7 @@ Every byte path in this project is `[]byte` — whole file in memory, no streami
 Two ceilings now hold it:
 
 - **`blossomd` streams uploads** (`storeStream`). The buffered version called `io.ReadAll` on the request body; `io.ReadAll` grows by reallocate-and-copy, so at the final growth both buffers are live and the peak is ~2× the blob — ~800 MB for the 412 MB blob, and the observed `MemoryPeak` was 796 MB. The cost of streaming is that the content address is unknown until the last byte, so a duplicate upload can no longer skip the write. That is one wasted temp file against a ceiling that does not move with the largest file anyone syncs.
-- **GC counts bytes, not workers** (`gc.Options.MaxInFlightBytes`, default 256 MB). Worker count is a useless memory dial when blob sizes span two orders of magnitude: six slots is 390 MB or 4.8 GB purely by draw. A blob larger than the whole budget is admitted alone rather than refused, because refusing it would deadlock the sweep on exactly the blobs most worth reclaiming.
+- **GC counts bytes, not workers** (`gc.Options.MaxInFlightBytes`, default 256 MB). Worker count is a useless memory dial when blob sizes span two orders of magnitude: six slots is 390 MB or 4.8 GB purely by draw. A blob larger than the whole budget is admitted alone rather than refused, because refusing it would deadlock the sweep on exactly the blobs most worth reclaiming. **`gc.Options.MaxInspectBytes` (CLI `--max-inspect-mb`)** is the complementary cap: proving ownership holds the sealed blob *and* its decrypted plaintext at once (~2× the blob), so on a small host the single largest blob is a guaranteed OOM. Over the cap, a candidate is counted in `Plan.TooLarge` and left in place — the sweep reclaims everything it safely can rather than dying on the one blob it cannot. On the 2 GB Pi with a 984 MiB orphan, that is the difference between a sweep and an OOM-kill.
 
 Neither change touches the wire format, the event codec, or blob addressing, so unlike the `created_at` fix this needs no coordinated upgrade — deploy the server where the server runs.
 
