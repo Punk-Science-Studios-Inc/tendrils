@@ -21,7 +21,8 @@ Built and tested (`go test ./...` green):
 | `internal/crypt` | Blob encryption at rest: AES-256-GCM, `nonce‖ciphertext`. The nonce is **deterministic** — SIV-style, `HMAC-SHA256(key, domain‖plaintext)[:12]` — so the same file under the same key always seals to the same bytes and therefore the same Blossom address. |
 | `internal/reconcile` | The pure conflict decision: LWW-by-mtime, delete-is-absolute, re-creation-honoured, conflict copies. Delete-is-absolute now includes **tombstone re-assertion**: a base tombstone facing a live remote entry no newer than it republishes the tombstone rather than pulling the file back, so a concurrent edit that displaced the delete on the relay cannot resurrect it. One test per Gherkin scenario. **The correctness-critical heart.** |
 | `internal/index` | bbolt store of the last-synced `Entry` per path (the reconcile "base") + last-reconcile time. Retains tombstones. Also holds per-path **`Retry`** state (failure count, next-attempt time, cause, permanent flag) in its own bucket — created on open, so an index from an older build upgrades in place. |
-| `internal/scan` | Walk the sync root → `Entry` map (sha256, mtime); skips `.tendrils-trash`; conflict-copy naming (`ConflictMarker`). |
+| `internal/scan` | Walk the sync root → `Entry` map (sha256, mtime) **plus `Coverage`**: unreadable folders, unreadable files, unsupported entries (symlinks, junctions) and subordinate mounts become `Gap`s instead of failing the scan. Ignored files are never opened; a directory is pruned only when no later `!` rule could re-include anything beneath it (`ignore.PruneDir`). Skips Tendrils bookkeeping (`Reserved`: trash, temp files, root marker); conflict-copy naming (`ConflictMarker`). |
+| `internal/rootid` | Sync-root identity: a `.tendrils-root` marker (random ID) plus the filesystem ID (Linux `f_fsid`, Windows volume serial), recorded in `config.json` at enroll/adopt. `Verify` is run before every pass and every destructive action. See "An absent root is not an empty tree" below. |
 | `internal/ignore` | gitignore-style matcher (`.tendrilsignore` subset: `#`, `!`, trailing `/`, anchored, `* ? **`). Used for both the **shared** synced ignore file and each node's **local** `exclude` patterns — see "Per-node exclusions" below. |
 | `internal/nostrevent` | `Entry` ⇄ Nostr event codec. Parameterized replaceable event, kind `31337`, `d`=path, `x`=sha256, `mtime`/`deleted` tags. **`created_at` = publication time, not mtime** — see "Two clocks" below. Signs/verifies. |
 | `internal/config` | State dir (`$TENDRILS_HOME` or OS config dir), local `config.json` (overrides discovery, plus the per-node **`exclude`** patterns), device key at rest (0600 file — deliberately not a keychain). |
@@ -33,7 +34,7 @@ Built and tested (`go test ./...` green):
 | `internal/gc` | Orphan blob reclamation: folds the relay's current truth into a keep-set, classifies every stored blob (kept / unreferenced / invalid / too-recent / not-ours), and deletes only what it can justify. Dry-run by default. See "Blob GC" below — it is the one operation syncing cannot undo. |
 | `internal/buildinfo` | Which build is running. Release builds stamp version/commit/date via `-ldflags -X`; everything else falls back to the toolchain's embedded module and VCS data, so a source build still reports a real commit and a dirty flag. Both binaries take the same stamp. |
 | `internal/selfupdate` | Finding, verifying and installing a newer release. Queries the public GitHub releases API (endpoint is a field, so tests drive it from an `httptest.Server`), compares semver, streams the archive to a staging dir **inside the destination**, verifies it against the release's `checksums.txt`, **execs the new binary and checks the version it reports**, then renames it into place. Caches the check in `update.json` (24 h; failures back off 15 m → 6 h). Also `Boundary`, the coordinated-upgrade gate fed by the release's `release.json`. No token, no credentials, no cgo. |
-| `cmd/tendrils` | **cobra** CLI: `keygen`, `enroll` (`--key`/`--root`/`--exclude`, reuses stored key), `status` (pending/conflicts/**stuck** from scan-vs-index), `exclude` (`list`/`add`/`remove` this device's local opt-outs), `daemon` (builds the engine from config and runs a periodic reconcile loop; `--interval`, graceful shutdown on Ctrl-C), `gc` (reclaim orphaned blobs; `--apply` to delete), `upgrade` (`--check`/`--version`/`--force`/`--yes`), `version`. Root sets `cobra.Command.Version`, so `--version`/`-v` work too, and its `PersistentPostRun` prints the cached update notice and schedules the next background check. |
+| `cmd/tendrils` | **cobra** CLI: `keygen`, `enroll` (`--key`/`--root`/`--exclude`, reuses stored key), `status` (pending/conflicts/**stuck**/**unavailable**/**paused** from scan-vs-index), `adopt` (verify and record the root's identity; required once for older enrollments), `exclude` (`list`/`add`/`remove` this device's local opt-outs), `daemon` (builds the engine from config and runs a periodic reconcile loop; `--interval`, graceful shutdown on Ctrl-C), `gc` (reclaim orphaned blobs; `--apply` to delete), `upgrade` (`--check`/`--version`/`--force`/`--yes`), `version`. Root sets `cobra.Command.Version`, so `--version`/`-v` work too, and its `PersistentPostRun` prints the cached update notice and schedules the next background check. |
 
 Not yet built (next milestones): **relay** discovery (NIP-65/kind-10002 — until then `daemon` still requires `--relay` set at enroll; Blossom-server discovery via kind-10063 **is** built, so `--blossom` is optional on later devices), fsnotify watch (with debounce/settle, to complement the periodic reconcile), Blossom multi-server mirroring (daemon uses the first server — which is also why a file too large for that one server simply cannot sync, however many are configured), and the tray. (Blossom **orphan GC** is now built — see "Blob GC" below.)
 
@@ -95,6 +96,41 @@ Three fixes, and all three matter:
 - **blossomd reports a 0-byte blob as 404** unless the address really is the empty hash, so pre-existing corruption stops lying immediately rather than waiting for a sweep.
 
 The general rule: **never let "it exists" stand in for "it is correct" when the consequence of being wrong is silent and permanent.**
+
+## An absent root is not an empty tree
+
+`internal/rootid`, `scan.Coverage`, `tendrils adopt`. This is the local twin of
+the next section: a scan that could not see something must not report it as
+gone.
+
+An unmounted drive leaves its mountpoint behind as an empty directory. Scanned,
+it is indistinguishable from the owner deleting every file, and `reconcile`
+would tombstone the whole tree on every device. Three rules prevent that:
+
+- **The root must prove it is the root.** Enrollment writes `.tendrils-root` (a
+  random ID) and records it plus the filesystem ID in `config.json`; neither is
+  synced, and `scan.Reserved` keeps the marker out of every plan. A pass whose
+  root is missing, unmarked, marked by another enrollment or on another
+  filesystem returns `*engine.Paused` and does nothing. Each delete, tombstone
+  and overwrite re-verifies first, so a drive pulled mid-pass stops the pass.
+- **Only observed absence is deletion.** Scan failures below the root become
+  `Gap`s. A path inside one is skipped entirely: not deleted, not published, not
+  written over. Such paths are counted in `Stats.Unavailable`, and so are gaps
+  with nothing known beneath them. They are never hidden. A filesystem mounted
+  inside the root is **not synced**: it is recorded in the index's `mounts`
+  bucket and stays a gap even after it is unmounted. That covers files an older
+  build synced from it. `adopt` forgets those boundaries.
+- **Adoption is explicit.** An enrollment with no recorded identity (any older
+  build) makes `daemon` refuse to start. `enroll` will not mark an unmarked
+  folder on a device that already has history. Both point to `tendrils adopt`,
+  which refuses a folder holding none of the last-synced files unless
+  `--force`. Silently adopting would adopt an empty mountpoint just as readily.
+
+FAT, exFAT and XFS derive `f_fsid` from the device number. A removable drive
+enumerated in a different order can therefore read as "another filesystem" and
+pause until it is adopted again. That is a false pause, never a false delete.
+Real-mount tests live behind `-tags mountintegration` (see
+`internal/engine/mount_linux_test.go` for the `unshare` harness, and the CI job).
 
 ## A read that failed is not an empty set
 

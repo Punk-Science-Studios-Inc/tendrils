@@ -30,8 +30,14 @@ type statusSnapshot struct {
 	Conflicts     int       `json:"conflicts"`
 	// Deferred counts paths that keep failing and are waiting out a retry
 	// backoff. They are included in Pending — this says how much of it is stuck.
-	Deferred int  `json:"deferred"`
-	Syncing  bool `json:"syncing"`
+	Deferred int `json:"deferred"`
+	// Unavailable counts paths the last scan could not observe; they are neither
+	// synced nor deleted until it can.
+	Unavailable int `json:"unavailable"`
+	// Paused says why the daemon is doing no work at all, e.g. the sync root is
+	// missing or is not the enrolled folder.
+	Paused  string `json:"paused,omitempty"`
+	Syncing bool   `json:"syncing"`
 	// Per-file progress within the current pass (meaningful only while Syncing).
 	Done      int    `json:"done"`
 	Total     int    `json:"total"`
@@ -123,6 +129,8 @@ func (srv *statusServer) handler(w http.ResponseWriter, _ *http.Request) {
 		Pending:       stats.Pending,
 		Conflicts:     stats.Conflicts,
 		Deferred:      stats.Deferred,
+		Unavailable:   stats.Unavailable,
+		Paused:        stats.Paused,
 		Syncing:       syncing,
 		Done:          prog.Done,
 		Total:         prog.Total,

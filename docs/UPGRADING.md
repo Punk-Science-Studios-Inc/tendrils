@@ -13,9 +13,21 @@ Read the ordering section before starting. Nothing here is destructive except
 On a device that already has Tendrils installed:
 
 ```sh
+systemctl --user stop tendrils-daemon.service
 tendrils upgrade                 # verify and replace both binaries
-systemctl --user restart tendrils-daemon.service
+tendrils adopt                   # once, on devices enrolled before root identities
+systemctl --user start tendrils-daemon.service
 ```
+
+**Root adoption (once per device).** Builds from this one on refuse to sync a
+folder they cannot identify, because an unmounted drive leaves an empty
+mountpoint behind, and that looks exactly like every file having been deleted.
+A device enrolled by an older build has no identity recorded, so its daemon
+exits with *"has no recorded identity … run 'tendrils adopt'"* until you adopt
+the folder. `adopt` needs the daemon stopped (it uses the index). It refuses a
+folder holding none of the files last synced there, and it never deletes
+anything. This is local only: the wire format does not change, and an
+un-upgraded device works alongside an upgraded one.
 
 `tendrils upgrade` downloads the release archive for this platform, verifies it
 against the release's `checksums.txt`, **runs the new binary and asks it its
@@ -255,8 +267,10 @@ journalctl --user -u tendrils-blossom.service -n 2 --no-pager
 **Linux / macOS**
 
 ```sh
+systemctl --user stop tendrils-daemon.service
 tendrils upgrade                                     # on a device that already has it
-systemctl --user restart tendrils-daemon.service
+tendrils adopt                                       # once, if enrolled by an older build
+systemctl --user start tendrils-daemon.service
 ```
 
 or, to bootstrap a machine that does not:
@@ -274,6 +288,9 @@ irm https://raw.githubusercontent.com/Punk-Science-Studios-Inc/tendrils/main/ins
 
 Then restart the daemon however it is registered — see the `install-windows`
 skill in this repo if it runs as a scheduled task or startup launcher.
+
+On any device enrolled by an older build, run `tendrils adopt` once with the
+daemon stopped, before starting it again.
 
 **From a working copy**
 

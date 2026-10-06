@@ -11,6 +11,7 @@ import (
 	"ca.punkscience.tendrils/internal/engine"
 	"ca.punkscience.tendrils/internal/index"
 	"ca.punkscience.tendrils/internal/keys"
+	"ca.punkscience.tendrils/internal/rootid"
 	"ca.punkscience.tendrils/internal/scan"
 	"ca.punkscience.tendrils/internal/tree"
 )
@@ -76,7 +77,7 @@ func localSnapshot(id *keys.Identity) (statusSnapshot, error) {
 	}
 	defer store.Close()
 
-	last, stats, err := computeStatus(store, cfg.SyncRoot, cfg.Exclude)
+	last, stats, err := computeStatus(store, cfg.SyncRoot, cfg.Root, cfg.Exclude)
 	if err != nil {
 		return snap, err
 	}
@@ -84,6 +85,8 @@ func localSnapshot(id *keys.Identity) (statusSnapshot, error) {
 	snap.Pending = stats.Pending
 	snap.Conflicts = stats.Conflicts
 	snap.Deferred = stats.Deferred
+	snap.Unavailable = stats.Unavailable
+	snap.Paused = stats.Paused
 	return snap, nil
 }
 
@@ -96,8 +99,10 @@ func localSnapshot(id *keys.Identity) (statusSnapshot, error) {
 //
 // It applies the same ignore rules the engine does (shared .tendrilsignore plus
 // this node's "exclude" patterns), so a path this node has opted out of and
-// deleted does not read as a forever-pending local deletion.
-func computeStatus(store *index.Store, root string, exclude []string) (last time.Time, stats engine.Stats, err error) {
+// deleted does not read as a forever-pending local deletion. A root that fails
+// verification is reported as paused rather than scanned: an empty mountpoint
+// would otherwise read as every file pending deletion.
+func computeStatus(store *index.Store, root string, rootID rootid.Identity, exclude []string) (last time.Time, stats engine.Stats, err error) {
 	last, err = store.LastReconcile()
 	if err != nil {
 		return
@@ -119,13 +124,39 @@ func computeStatus(store *index.Store, root string, exclude []string) (last time
 	if root == "" {
 		return
 	}
-	local, err := scan.Tree(root, base)
+	if verr := rootid.Verify(root, rootID); verr != nil {
+		stats.Paused = verr.Error()
+		return
+	}
+	ign, ierr := engine.IgnoreMatcher(root, exclude)
+	if ierr != nil {
+		stats.Paused = ierr.Error()
+		return
+	}
+	mounts, err := store.Mounts()
 	if err != nil {
 		return
 	}
-	ign := engine.IgnoreMatcher(root, exclude)
+	scanned, err := scan.Tree(root, scan.Options{Base: base, Ignore: ign, Mounts: mounts})
+	if err != nil {
+		return
+	}
+	local, cov := scanned.Entries, scanned.Coverage
+	known := make([]string, 0, len(local)+len(base))
+	for path := range local {
+		known = append(known, path)
+	}
+	for path, b := range base {
+		if _, ok := local[path]; !ok && b.Live() {
+			known = append(known, path)
+		}
+	}
+	stats.Unavailable = engine.CountUnavailable(cov, ign, known)
 
 	for path, e := range local {
+		if !cov.Observed(path) {
+			continue
+		}
 		if ign.Match(path) {
 			continue // invisible to this node; neither pending nor a conflict
 		}
@@ -138,7 +169,7 @@ func computeStatus(store *index.Store, root string, exclude []string) (last time
 		}
 	}
 	for path, b := range base {
-		if !b.Live() || ign.Match(path) {
+		if !b.Live() || ign.Match(path) || !cov.Observed(path) {
 			continue
 		}
 		if _, stillHere := local[path]; !stillHere {
@@ -154,12 +185,18 @@ func printStatus(out io.Writer, snap statusSnapshot, daemonRunning bool) {
 	fmt.Fprintln(out, "Relays:   ", orDiscovery(snap.Relays))
 	fmt.Fprintln(out, "Storage:  ", orDiscovery(snap.Storage))
 	fmt.Fprintln(out, "Daemon:   ", daemonState(daemonRunning, snap.Syncing))
+	if snap.Paused != "" {
+		fmt.Fprintln(out, "Paused:   ", snap.Paused)
+	}
 	if snap.Syncing {
 		fmt.Fprintln(out, "Progress: ", progressLine(snap))
 	}
 	fmt.Fprintln(out, "Last reconcile:", formatTime(snap.LastReconcile))
 	fmt.Fprintln(out, "Pending changes:", snap.Pending)
 	fmt.Fprintln(out, "Conflicts:     ", snap.Conflicts)
+	if snap.Unavailable > 0 {
+		fmt.Fprintf(out, "Unavailable:     %d (could not be read; held back, never treated as deleted)\n", snap.Unavailable)
+	}
 	if snap.Deferred > 0 {
 		fmt.Fprintf(out, "Stuck:           %d (repeatedly failed, waiting out a retry backoff)\n", snap.Deferred)
 	}

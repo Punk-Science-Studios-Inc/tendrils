@@ -14,6 +14,7 @@ import (
 	"ca.punkscience.tendrils/internal/index"
 	"ca.punkscience.tendrils/internal/keys"
 	"ca.punkscience.tendrils/internal/nostrevent"
+	"ca.punkscience.tendrils/internal/rootid"
 	"ca.punkscience.tendrils/internal/scan"
 	"ca.punkscience.tendrils/internal/tree"
 )
@@ -98,7 +99,11 @@ func newEngine(t *testing.T, root string, id *keys.Identity, ev EventStore, bl B
 		t.Fatalf("open index: %v", err)
 	}
 	t.Cleanup(func() { idx.Close() })
-	eng, err := New(root, id, idx, bl, ev, nil)
+	rid, err := rootid.Establish(root)
+	if err != nil {
+		t.Fatalf("establish root: %v", err)
+	}
+	eng, err := New(root, rid, id, idx, bl, ev, nil)
 	if err != nil {
 		t.Fatalf("new engine: %v", err)
 	}
@@ -836,7 +841,10 @@ func TestLocalExcludeCanReincludeSharedIgnore(t *testing.T) {
 
 // A missing .tendrilsignore is not an error: local patterns still apply.
 func TestIgnoreMatcherWithoutSharedFile(t *testing.T) {
-	m := IgnoreMatcher(t.TempDir(), []string{"music/"})
+	m, err := IgnoreMatcher(t.TempDir(), []string{"music/"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if m == nil {
 		t.Fatal("IgnoreMatcher returned nil")
 	}

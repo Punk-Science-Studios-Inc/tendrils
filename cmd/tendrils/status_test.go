@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"ca.punkscience.tendrils/internal/index"
+	"ca.punkscience.tendrils/internal/rootid"
 	"ca.punkscience.tendrils/internal/scan"
 	"ca.punkscience.tendrils/internal/tree"
 )
@@ -25,16 +26,20 @@ func TestComputeStatusAppliesExclude(t *testing.T) {
 	defer store.Close()
 
 	root := t.TempDir()
+	rid, err := rootid.Establish(root)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(root, "keep.md"), []byte("note"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	// Base records keep.md as synced, plus a music file absent from disk, as if
 	// this node had synced it and then excluded and deleted it.
-	local, err := scan.Tree(root, nil)
+	scanned, err := scan.Tree(root, scan.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, e := range local {
+	for _, e := range scanned.Entries {
 		if err := store.Put(e); err != nil {
 			t.Fatal(err)
 		}
@@ -43,7 +48,7 @@ func TestComputeStatusAppliesExclude(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, stats, err := computeStatus(store, root, nil)
+	_, stats, err := computeStatus(store, root, rid, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +56,7 @@ func TestComputeStatusAppliesExclude(t *testing.T) {
 		t.Fatalf("without exclude: pending=%d, want 1 (the deleted music path)", stats.Pending)
 	}
 
-	_, stats, err = computeStatus(store, root, []string{"music/"})
+	_, stats, err = computeStatus(store, root, rid, []string{"music/"})
 	if err != nil {
 		t.Fatal(err)
 	}

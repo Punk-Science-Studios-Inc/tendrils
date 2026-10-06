@@ -91,6 +91,23 @@ jobs:
         env:
           CGO_ENABLED: 1
 
+  # The root-identity guard exists for real mounts: a drive unmounted from under
+  # the sync root, and filesystems mounted inside it. Those need CAP_SYS_ADMIN,
+  # so they are tagged out of the default run and exercised here with sudo.
+  mounts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - run: go test -c -tags mountintegration -o mount.test ./internal/engine
+
+      - run: sudo ./mount.test -test.run Mount -test.v
+
   # Catch a broken .goreleaser.yaml here rather than on a tag, where the tag is
   # already pushed and the fix needs a new one.
   release-dry-run:

@@ -9,6 +9,7 @@ import (
 
 	"ca.punkscience.tendrils/internal/config"
 	"ca.punkscience.tendrils/internal/keys"
+	"ca.punkscience.tendrils/internal/rootid"
 )
 
 func newEnrollCmd() *cobra.Command {
@@ -36,6 +37,10 @@ func newEnrollCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			rootID, err := establishEnrolledRoot(root)
+			if err != nil {
+				return err
+			}
 
 			if err := config.SaveKey(id); err != nil {
 				return err
@@ -46,6 +51,7 @@ func newEnrollCmd() *cobra.Command {
 				return err
 			}
 			cfg.SyncRoot = root
+			cfg.Root = rootID
 			if len(relays) > 0 {
 				cfg.Relays = relays
 			}
@@ -97,6 +103,44 @@ func resolveKey(keyArg string) (*keys.Identity, error) {
 		return nil, fmt.Errorf("no key given and none stored: pass --key <nsec> or run 'tendrils keygen'")
 	}
 	return id, nil
+}
+
+// establishEnrolledRoot marks root as this device's sync folder. A device that
+// has synced before must not have its history pointed at an unmarked folder —
+// an empty mountpoint, a fresh directory — because the next pass would read
+// every file it remembers as deleted. That case is left to an explicit adopt.
+func establishEnrolledRoot(root string) (rootid.Identity, error) {
+	if _, hasMarker, err := rootid.HasMarker(root); err != nil {
+		return rootid.Identity{}, err
+	} else if !hasMarker {
+		idx, err := openIndexForRoot()
+		if err != nil {
+			return rootid.Identity{}, err
+		}
+		base, err := idx.All()
+		idx.Close()
+		if err != nil {
+			return rootid.Identity{}, err
+		}
+		live := 0
+		for _, e := range base {
+			if e.Live() {
+				live++
+			}
+		}
+		if live > 0 {
+			return rootid.Identity{}, fmt.Errorf("this device has synced %d files before, and %s is not a marked sync folder: if it is the same tree (for example, a drive enrolled by an older build), run 'tendrils adopt'; to start this device over, remove %s first", live, root, mustIndexPath())
+		}
+	}
+	return rootid.Establish(root)
+}
+
+func mustIndexPath() string {
+	p, err := config.IndexPath()
+	if err != nil {
+		return "the index"
+	}
+	return p
 }
 
 // prepareRoot validates and creates the sync root, returning its absolute path.

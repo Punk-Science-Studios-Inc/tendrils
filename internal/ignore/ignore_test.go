@@ -64,3 +64,54 @@ func TestEmptyAndComments(t *testing.T) {
 		t.Error("nil matcher should match nothing")
 	}
 }
+
+func TestPruneDir(t *testing.T) {
+	m := Compile([]string{"music/", "build/", "!build/keep.txt", "*.tmp", "logs/", "!logs/"})
+	cases := map[string]bool{
+		"music":         false, // a later negation exists, so nothing is safe to prune
+		"notes":         false,
+		"build":         false,
+		"music/albums":  false,
+		"logs":          false,
+		"x.tmp":         false,
+		"notes/archive": false,
+	}
+	for dir, want := range cases {
+		if got := m.PruneDir(dir); got != want {
+			t.Errorf("PruneDir(%q) = %v, want %v", dir, got, want)
+		}
+	}
+
+	m = Compile([]string{"!music/keep.flac", "music/", "*.tmp"})
+	cases = map[string]bool{
+		"music":        true, // the earlier negation is overridden for everything beneath
+		"music/albums": true,
+		"notes":        false,
+		"cache.tmp":    true,
+		"a/cache.tmp":  true,
+	}
+	for dir, want := range cases {
+		if got := m.PruneDir(dir); got != want {
+			t.Errorf("PruneDir(%q) = %v, want %v", dir, got, want)
+		}
+	}
+
+	if (*Matcher)(nil).PruneDir("music") {
+		t.Error("nil matcher pruned a directory")
+	}
+}
+
+// Pruning must agree with Match: a pruned directory hides only paths Match
+// would also ignore.
+func TestPruneDirAgreesWithMatch(t *testing.T) {
+	m := Compile([]string{"music/", "!music/keep/", "music/keep/drop.wav"})
+	if m.PruneDir("music") {
+		t.Fatal("pruned a directory with a later re-inclusion beneath it")
+	}
+	if m.Match("music/keep/song.flac") {
+		t.Fatal("re-included path reported ignored")
+	}
+	if !m.Match("music/keep/drop.wav") || !m.Match("music/other.flac") {
+		t.Fatal("ignored paths reported included")
+	}
+}

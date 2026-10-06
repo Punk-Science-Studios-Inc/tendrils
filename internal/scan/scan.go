@@ -16,6 +16,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"ca.punkscience.tendrils/internal/ignore"
+	"ca.punkscience.tendrils/internal/rootid"
 	"ca.punkscience.tendrils/internal/tree"
 )
 
@@ -44,62 +46,196 @@ func IsConflictCopy(path string) bool {
 	return strings.Contains(filepath.Base(path), ConflictMarker)
 }
 
-// Tree walks root and returns a live Entry for every regular file, keyed by
-// forward-slash relative path. The trash directory and dotfiles Tendrils owns
-// are skipped. Symlinks are not followed.
-//
-// base is the last-synced index (nil for a full hash). A file whose size and
-// modification time still match its base entry is assumed unchanged and its
-// stored hash is reused instead of re-reading and re-hashing the bytes — the
-// difference between a scan that stats every file and one that reads all of them,
-// which on a large tree is the whole cost of a pass. The tradeoff is the standard
-// one: a change that preserves both size and mtime (rare, and defeats most sync
-// tools) is missed until one of them moves.
-func Tree(root string, base map[string]*tree.Entry) (map[string]*tree.Entry, error) {
-	out := make(map[string]*tree.Entry)
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
+// Options shapes a scan.
+type Options struct {
+	// Base is the last-synced index, used as a size+mtime cache (nil hashes
+	// everything). A file whose size and modification time still match its base
+	// entry is assumed unchanged and its stored hash is reused instead of
+	// re-reading the bytes — the difference between a scan that stats every file
+	// and one that reads all of them. The tradeoff is the standard one: a change
+	// that preserves both size and mtime is missed until one of them moves.
+	Base map[string]*tree.Entry
+	// Ignore is the node's effective ignore rules. Ignored files are never
+	// opened or hashed, and a directory nothing beneath which can be re-included
+	// is not even read.
+	Ignore *ignore.Matcher
+	// Mounts are subordinate mount boundaries seen on earlier scans. They are
+	// reported unobserved whether or not anything is mounted there now, which is
+	// what keeps an unmounted one — an empty directory — from reading as deleted.
+	Mounts []string
+}
+
+// Result is what a scan saw, and what it could not see.
+type Result struct {
+	Entries  map[string]*tree.Entry
+	Coverage Coverage
+}
+
+// Gap is a root-relative path the scan could not observe: an unreadable
+// directory, a file that could not be read, a subordinate mount, or an entry of
+// a type Tendrils does not sync. It covers the path and everything beneath it.
+type Gap struct {
+	Path   string
+	Reason string
+}
+
+// Coverage records where a scan's silence is not evidence. A path missing from
+// Result.Entries only means "deleted" when Observed says it was looked at.
+type Coverage struct {
+	Gaps []Gap
+	// Mounts lists every subordinate mount boundary known after this scan:
+	// Options.Mounts plus any found now. Callers persist it.
+	Mounts []string
+	gaps   map[string]string
+}
+
+// Observed reports whether path, and every directory above it, was completely
+// read — and therefore whether its absence may be taken as a deletion.
+func (c Coverage) Observed(path string) bool {
+	_, unseen := c.GapFor(path)
+	return !unseen
+}
+
+// GapFor returns the gap covering path, if any.
+func (c Coverage) GapFor(path string) (string, bool) {
+	if len(c.gaps) == 0 {
+		return "", false
+	}
+	if _, ok := c.gaps["."]; ok {
+		return ".", true
+	}
+	for p := path; ; {
+		if _, ok := c.gaps[p]; ok {
+			return p, true
 		}
+		i := strings.LastIndexByte(p, '/')
+		if i < 0 {
+			return "", false
+		}
+		p = p[:i]
+	}
+}
+
+func (c *Coverage) add(path, reason string) {
+	if c.gaps == nil {
+		c.gaps = make(map[string]string)
+	}
+	if _, ok := c.gaps[path]; ok {
+		return
+	}
+	c.gaps[path] = reason
+	c.Gaps = append(c.Gaps, Gap{Path: path, Reason: reason})
+}
+
+// Tree walks root and returns a live Entry for every regular file it could read,
+// keyed by forward-slash relative path, plus the coverage of that walk. Tendrils'
+// own bookkeeping is skipped. Symlinks are not followed.
+//
+// A failure under the root does not fail the scan: it becomes a Gap, so one
+// unreadable folder neither stalls the rest of the tree nor reads as a deletion.
+// Only a root that cannot be read at all is an error.
+func Tree(root string, opt Options) (Result, error) {
+	res := Result{Entries: make(map[string]*tree.Entry)}
+	cov := &res.Coverage
+	known := make(map[string]bool, len(opt.Mounts))
+	for _, m := range opt.Mounts {
+		known[m] = true
+		cov.Mounts = append(cov.Mounts, m)
+		cov.add(m, "subordinate mount point")
+	}
+	rootInfo, err := os.Stat(root)
+	if err != nil {
+		return Result{}, fmt.Errorf("scan: %w", err)
+	}
+
+	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		rel, relErr := filepath.Rel(root, path)
 		if relErr != nil {
 			return relErr
 		}
 		rel = filepath.ToSlash(rel)
-
-		if d.IsDir() {
-			if rel != "." && ignoredDir(rel) {
+		if err != nil {
+			if rel == "." || d == nil {
+				return err
+			}
+			cov.add(rel, err.Error())
+			if d.IsDir() {
 				return fs.SkipDir
 			}
 			return nil
 		}
-		if !d.Type().IsRegular() {
-			return nil // skip symlinks, sockets, devices
+		if rel != "." && Reserved(rel) {
+			if d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
 		}
-		if isTempFile(rel) {
-			return nil // an atomic-write temp orphaned by a crash; never sync it
+
+		if d.IsDir() {
+			if rel == "." {
+				return nil
+			}
+			if opt.Ignore.PruneDir(rel) {
+				return fs.SkipDir
+			}
+			if known[rel] {
+				return fs.SkipDir
+			}
+			info, err := d.Info()
+			if err != nil {
+				cov.add(rel, err.Error())
+				return fs.SkipDir
+			}
+			if !sameDevice(rootInfo, info) {
+				known[rel] = true
+				cov.Mounts = append(cov.Mounts, rel)
+				cov.add(rel, "subordinate mount point")
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if opt.Ignore.Match(rel) {
+			return nil
+		}
+		if !d.Type().IsRegular() {
+			cov.add(rel, "unsupported file type (symlink, junction or device)")
+			return nil
 		}
 
 		info, err := d.Info()
 		if err != nil {
-			return fmt.Errorf("scan: stat %s: %w", rel, err)
-		}
-		if e := reuse(base[rel], rel, info); e != nil {
-			out[rel] = e
+			cov.add(rel, err.Error())
 			return nil
 		}
-
+		if e := reuse(opt.Base[rel], rel, info); e != nil {
+			res.Entries[rel] = e
+			return nil
+		}
 		entry, err := hashFile(path, rel)
 		if err != nil {
-			return err
+			cov.add(rel, err.Error())
+			return nil
 		}
-		out[rel] = entry
+		res.Entries[rel] = entry
 		return nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("scan: walk %s: %w", root, err)
+		return Result{}, fmt.Errorf("scan: walk %s: %w", root, err)
 	}
-	return out, nil
+	return res, nil
+}
+
+// Reserved reports whether a root-relative path is Tendrils' own bookkeeping:
+// the trash, an atomic-write temp file, or the root marker. Such a path is never
+// scanned, published, pulled or deleted, whichever side names it.
+func Reserved(rel string) bool {
+	if rel == TrashDir || strings.HasPrefix(rel, TrashDir+"/") {
+		return true
+	}
+	if isTempFile(rel) {
+		return true
+	}
+	return rel == rootid.MarkerName || strings.HasPrefix(rel, rootid.MarkerName+".tmp-")
 }
 
 // reuse returns a scan entry taken from base when the on-disk file's size and
@@ -149,10 +285,4 @@ func hashFile(abs, rel string) (*tree.Entry, error) {
 		Size:    info.Size(),
 		ModTime: info.ModTime(),
 	}, nil
-}
-
-// ignoredDir reports whether a directory (by its root-relative slash path) is
-// Tendrils bookkeeping that must not be synced.
-func ignoredDir(rel string) bool {
-	return rel == TrashDir || strings.HasPrefix(rel, TrashDir+"/")
 }

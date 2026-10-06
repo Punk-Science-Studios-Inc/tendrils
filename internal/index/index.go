@@ -18,6 +18,7 @@ var (
 	entriesBucket = []byte("entries")
 	metaBucket    = []byte("meta")
 	retriesBucket = []byte("retries")
+	mountsBucket  = []byte("mounts")
 	lastReconcile = []byte("last-reconcile")
 )
 
@@ -49,7 +50,7 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("index: open %s: %w", path, err)
 	}
 	err = db.Update(func(tx *bbolt.Tx) error {
-		for _, b := range [][]byte{entriesBucket, metaBucket, retriesBucket} {
+		for _, b := range [][]byte{entriesBucket, metaBucket, retriesBucket, mountsBucket} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -180,4 +181,43 @@ func (s *Store) LastReconcile() (time.Time, error) {
 		return at.UnmarshalBinary(v)
 	})
 	return at, err
+}
+
+// Mounts returns the subordinate mount boundaries recorded under the sync root,
+// as root-relative directories. They are remembered so that an unmounted one,
+// left behind as an empty directory, is still known to be a boundary.
+func (s *Store) Mounts() ([]string, error) {
+	var out []string
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		return tx.Bucket(mountsBucket).ForEach(func(k, _ []byte) error {
+			out = append(out, string(k))
+			return nil
+		})
+	})
+	return out, err
+}
+
+// AddMounts records further mount boundaries; existing ones are kept.
+func (s *Store) AddMounts(dirs []string) error {
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(mountsBucket)
+		for _, d := range dirs {
+			if err := b.Put([]byte(d), []byte{}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// ResetMounts forgets every recorded mount boundary. Adoption calls it, so a
+// boundary the owner has removed for good stops holding its subtree back.
+func (s *Store) ResetMounts() error {
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		if err := tx.DeleteBucket(mountsBucket); err != nil {
+			return err
+		}
+		_, err := tx.CreateBucket(mountsBucket)
+		return err
+	})
 }

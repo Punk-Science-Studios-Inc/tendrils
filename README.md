@@ -159,6 +159,29 @@ and then delete it locally. That deletion is invisible too: it will not propagat
 to other devices and the folder will not be pulled back. Restart the daemon after
 changing the list.
 
+## When the folder is not there
+
+Enrollment drops a small `.tendrils-root` marker in the sync folder and records it,
+plus the folder's filesystem, in the local `config.json`. Neither is ever synced.
+Every pass checks both before reading anything. If the folder is missing, or is
+an empty mountpoint left by an unmounted drive, or is a different drive or copy,
+the daemon **pauses** — nothing is pulled, published or deleted — and resumes on
+its own once the right folder is back. `tendrils status` shows why under
+`Paused:`.
+
+Parts of the tree that cannot be read (permissions, a filesystem mounted inside
+the folder, symlinks) are reported as `Unavailable` and held back. They are never
+read as deleted. Filesystems mounted inside the sync folder are not synced.
+
+An enrollment from an older build has no marker yet. The daemon will not start
+until you adopt the folder once (stop the daemon first):
+
+```sh
+tendrils adopt        # refuses a folder holding none of the files last synced here
+```
+
+Run it again after deliberately moving the folder to another drive.
+
 ## How it works
 
 | Piece | Role |

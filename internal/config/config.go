@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"ca.punkscience.tendrils/internal/keys"
+	"ca.punkscience.tendrils/internal/rootid"
 )
 
 const (
@@ -37,6 +38,10 @@ type Config struct {
 	// SyncRoot is the absolute path of the folder this device syncs. Each device
 	// may place it wherever it likes; identity is by relative path, not root.
 	SyncRoot string `json:"sync_root"`
+	// Root is the identity recorded when SyncRoot was enrolled or adopted: the
+	// ID in its marker file and its filesystem. Absent on enrollments from older
+	// builds, which must run `tendrils adopt` before the daemon will sync.
+	Root rootid.Identity `json:"root,omitzero"`
 	// Relays lists Nostr relay URLs. Empty means "discover from the key".
 	Relays []string `json:"relays,omitempty"`
 	// BlossomServers lists Blossom server URLs for blob storage. Empty means
