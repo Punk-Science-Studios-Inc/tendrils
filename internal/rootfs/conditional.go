@@ -46,11 +46,16 @@ func (want Expect) matches(info fs.FileInfo, err error) error {
 	return nil
 }
 
-// Unchanged reports ErrChanged if rel no longer matches want.
+// Unchanged reports ErrChanged if rel no longer matches want. A file another
+// process holds open is waited for, as a replacement would be.
 func (f *FS) Unchanged(rel string, want Expect) error {
 	if err := f.Check(rel); err != nil {
 		return err
 	}
+	return f.whileShared(func() error { return f.unchanged(rel, want) })
+}
+
+func (f *FS) unchanged(rel string, want Expect) error {
 	if err := f.confined(rel); err != nil {
 		return err
 	}
@@ -65,9 +70,6 @@ func (f *FS) Unchanged(rel string, want Expect) error {
 // file another process holds open without delete sharing makes the rename fail,
 // which leaves the original in place and the work pending.
 func (p *Pending) CommitIf(mtime time.Time, want Expect) error {
-	if err := p.f.Unchanged(p.rel, want); err != nil {
-		return err
-	}
 	if _, err := p.Seal(mtime); err != nil {
 		return err
 	}
@@ -185,8 +187,8 @@ func (f *FS) Preserve(rel string, want Expect, name func() string) (string, erro
 
 // TrashIf is Trash, refused with ErrChanged if rel no longer matches want.
 func (f *FS) TrashIf(rel string, want Expect) error {
-	if err := f.Unchanged(rel, want); err != nil {
+	if err := f.Check(rel); err != nil {
 		return err
 	}
-	return f.Trash(rel)
+	return f.trashTo(rel, f.TrashName(rel), &want)
 }

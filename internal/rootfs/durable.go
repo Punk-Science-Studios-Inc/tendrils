@@ -42,23 +42,28 @@ func (f *FS) promote(tmp, rel string, want *Expect) error {
 	if err := f.spelled(rel); err != nil {
 		return err
 	}
-	if want != nil {
-		if err := f.Unchanged(rel, *want); err != nil {
-			return err
+	err := f.whileShared(func() error {
+		if want != nil {
+			if err := f.unchanged(rel, *want); err != nil {
+				return err
+			}
 		}
-	}
-	if err := f.rename(tmp, rel); err != nil {
+		return f.root.Rename(tmp, rel)
+	})
+	if err != nil {
 		return err
 	}
 	return f.syncDir(path.Dir(rel))
 }
 
-// rename retries a sharing violation a bounded number of times.
-func (f *FS) rename(from, to string) error {
+// whileShared retries step while another process holds a file it needs, a
+// bounded number of times. On Windows that lock fails the stat as well as the
+// rename, so the check and the move are retried together.
+func (f *FS) whileShared(step func() error) error {
 	wait := RenameBackoff
 	var err error
 	for i := 0; i < RenameAttempts; i++ {
-		if err = f.root.Rename(from, to); err == nil || !isSharingViolation(err) {
+		if err = step(); err == nil || !isSharingViolation(err) {
 			return err
 		}
 		time.Sleep(wait)
@@ -162,15 +167,18 @@ func (f *FS) trashTo(rel, dst string, want *Expect) error {
 	if err := f.spelled(rel); err != nil {
 		return err
 	}
-	if want != nil {
-		if err := f.Unchanged(rel, *want); err != nil {
-			return err
-		}
-	}
 	if _, err := f.root.Lstat(dst); err == nil {
 		return &fs.PathError{Op: "trash", Path: dst, Err: fs.ErrExist}
 	}
-	if err := f.rename(rel, dst); err != nil {
+	err := f.whileShared(func() error {
+		if want != nil {
+			if err := f.unchanged(rel, *want); err != nil {
+				return err
+			}
+		}
+		return f.root.Rename(rel, dst)
+	})
+	if err != nil {
 		return err
 	}
 	if err := f.syncDir(path.Dir(rel)); err != nil {
