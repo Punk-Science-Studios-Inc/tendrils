@@ -106,7 +106,7 @@ func TestParentSwappedAfterCreateIsRefusedAtCommit(t *testing.T) {
 	p.Write([]byte("data"))
 	// Replace the real directory with a link to outside between create and commit.
 	if err := os.Rename(filepath.Join(root, "notes"), filepath.Join(root, "moved")); err != nil {
-		t.Fatal(err)
+		t.Skipf("directory holding an open file cannot be moved here (Windows): %v", err)
 	}
 	if err := os.Symlink(outside, filepath.Join(root, "notes")); err != nil {
 		t.Skipf("symlinks unavailable: %v", err)
@@ -149,7 +149,7 @@ func TestReplacedRootStopsMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.Rename(root, root+".old"); err != nil {
-		t.Fatal(err)
+		t.Skipf("an open root cannot be moved here (Windows): %v", err)
 	}
 	if err := os.Mkdir(root, 0o755); err != nil {
 		t.Fatal(err)
