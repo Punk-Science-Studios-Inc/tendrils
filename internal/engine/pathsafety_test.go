@@ -214,3 +214,52 @@ func TestUnicodeAndLongPathsConverge(t *testing.T) {
 		t.Fatalf("B has %q %v", got, ok)
 	}
 }
+
+// The same rename made on this device: the old spelling is tombstoned and the
+// new one published, with nothing blocked.
+func TestCaseOnlyRenameOriginatesLocally(t *testing.T) {
+	ev, bl := newFakeEvents(), newFakeBlobs()
+	eng, root, _, stats := confinedTree(t, ev, bl)
+	withPlatform(eng, syncpath.Platform{CaseInsensitive: true})
+	writeFile(t, root, "a.txt", "v1", t0)
+	if err := eng.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(root, "a.txt"), filepath.Join(root, "A.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if stats.Blocked != 0 {
+		t.Fatalf("locally originated case-only rename reported %d blocked", stats.Blocked)
+	}
+	if got := tombstones(t, ev); len(got) != 1 || got[0] != "a.txt" {
+		t.Errorf("tombstones = %v, want [a.txt]", got)
+	}
+	if _, ok := ev.byPath["A.txt"]; !ok {
+		t.Error("new spelling was not published")
+	}
+}
+
+// A path under a temp-named directory would be pruned by the next scan and
+// then read as deleted, so it is never pulled.
+func TestPathUnderTempNameIsNotPulled(t *testing.T) {
+	ev, bl := newFakeEvents(), newFakeBlobs()
+	eng, root, _, stats := confinedTree(t, ev, bl)
+	seedRemote(t, ev, bl, eng.id, ".tendrils-tmp-dir/file.txt", "x", t0)
+	for range 2 {
+		if err := eng.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, ok := readFile(t, root, ".tendrils-tmp-dir/file.txt"); ok {
+		t.Error("file under a temp-named directory was written")
+	}
+	if got := tombstones(t, ev); len(got) != 0 {
+		t.Errorf("tombstoned %v", got)
+	}
+	if stats.Blocked != 1 {
+		t.Errorf("blocked = %d, want 1", stats.Blocked)
+	}
+}

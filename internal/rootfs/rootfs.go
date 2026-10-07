@@ -81,12 +81,15 @@ func OpenVerified(root string, id rootid.Identity) (*FS, error) {
 // probeCase asks the filesystem itself whether case matters, using the marker
 // (or failing that, the default for the OS). Linux mounts exFAT and VFAT
 // case-insensitively, and Windows can enable case sensitivity per directory.
+// Both spellings must be the same file: a user's own .TENDRILS-ROOT on a
+// case-sensitive root is a different one.
 func (f *FS) probeCase() {
-	if _, err := f.root.Lstat(syncpath.MarkerName); err != nil {
+	lower, err := f.root.Lstat(syncpath.MarkerName)
+	if err != nil {
 		return
 	}
-	_, err := f.root.Lstat(strings.ToUpper(syncpath.MarkerName))
-	f.plat.CaseInsensitive = err == nil
+	upper, err := f.root.Lstat(strings.ToUpper(syncpath.MarkerName))
+	f.plat.CaseInsensitive = err == nil && os.SameFile(lower, upper)
 }
 
 func (f *FS) Close() error { return f.root.Close() }
@@ -134,6 +137,9 @@ func (f *FS) FS() fs.FS { return f.root.FS() }
 // Lstat stats rel without following a final symlink.
 func (f *FS) Lstat(rel string) (fs.FileInfo, error) {
 	if err := f.Check(rel); err != nil {
+		return nil, err
+	}
+	if err := f.confined(rel); err != nil {
 		return nil, err
 	}
 	return f.root.Lstat(rel)
@@ -314,6 +320,9 @@ func (p *Pending) Commit(mtime time.Time) error {
 		return err
 	}
 	if err := p.f.confined(p.rel); err != nil {
+		return err
+	}
+	if err := p.f.spelled(p.rel); err != nil {
 		return err
 	}
 	if err := p.f.root.Rename(p.tmp, p.rel); err != nil {

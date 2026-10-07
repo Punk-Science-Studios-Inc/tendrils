@@ -250,7 +250,7 @@ func (e *Engine) Sync(ctx context.Context) error {
 	var withheld int
 	unseen := newUnseen(cov, ign)
 	paths := unionPaths(local, base, remote)
-	blocked := blockedPaths(e.fs, ign, paths, scanned.Blocked, local, remote)
+	blocked := blockedPaths(e.fs, ign, paths, scanned.Blocked, cov, base, local, remote)
 	for _, path := range paths {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -407,9 +407,9 @@ type blocked struct {
 // blockedPaths finds every known path that is invalid, unrepresentable here, or
 // — on a case-insensitive root — would share a file or directory with a
 // differently-cased name. Only names that would be live after this pass take
-// part in a collision: a spelling the relay has tombstoned is about to go, and
-// counting it would block every case-only rename.
-func blockedPaths(fsys *rootfs.FS, ign *ignore.Matcher, paths []string, scanned map[string]string, local, remote map[string]*tree.Entry) blocked {
+// part in a collision: a spelling this pass removes or tombstones is about to
+// go, and counting it would block every case-only rename, from either side.
+func blockedPaths(fsys *rootfs.FS, ign *ignore.Matcher, paths []string, scanned map[string]string, cov scan.Coverage, base, local, remote map[string]*tree.Entry) blocked {
 	b := blocked{reasons: make(map[string]string)}
 	for p, reason := range scanned {
 		if !ign.Match(p) && !ign.PruneDir(p) {
@@ -425,7 +425,7 @@ func blockedPaths(fsys *rootfs.FS, ign *ignore.Matcher, paths []string, scanned 
 			b.reasons[p] = err.Error()
 			continue
 		}
-		if remote[p].Live() || (local[p].Live() && !remote[p].Tomb()) {
+		if liveAfterPass(cov.Observed(p), base[p], local[p], remote[p]) {
 			live = append(live, p)
 		}
 	}
@@ -435,6 +435,23 @@ func blockedPaths(fsys *rootfs.FS, ign *ignore.Matcher, paths []string, scanned 
 		}
 	}
 	return b
+}
+
+// liveAfterPass reports whether a name will exist after this pass if it is not
+// blocked. An unobserved path is held as it is, so it counts as live if either
+// side has it.
+func liveAfterPass(observed bool, base, local, remote *tree.Entry) bool {
+	if !observed {
+		return local.Live() || remote.Live()
+	}
+	switch reconcile.Decide(base, local, remote).Op {
+	case reconcile.OpWriteRemote, reconcile.OpPublishLocal:
+		return true
+	case reconcile.OpDeleteLocal, reconcile.OpPublishDelete:
+		return false
+	default:
+		return local.Live()
+	}
 }
 
 func (b blocked) holds(p string) bool {

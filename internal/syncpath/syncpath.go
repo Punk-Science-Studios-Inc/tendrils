@@ -32,8 +32,8 @@ const (
 	MarkerName = ".tendrils-root"
 )
 
-// MaxComponent is the longest single path component both target platforms
-// accept: 255 bytes on Linux filesystems, 255 UTF-16 code units on NTFS.
+// MaxComponent is the longest single path component: 255 bytes on Linux
+// filesystems, 255 UTF-16 code units on NTFS.
 const MaxComponent = 255
 
 // Platform describes the local filesystem's naming rules.
@@ -132,8 +132,9 @@ func hasDrive(path string) bool {
 }
 
 // Reserved reports whether path is Tendrils' own bookkeeping: the trash, an
-// atomic-write temp file, or the root marker. On a case-insensitive root a
-// differently-cased spelling names the same file, so it is reserved too.
+// atomic-write temp name in any component, or the root marker. Scan prunes all
+// of these, so a path under one would read as deleted on the next pass. On a
+// case-insensitive root a differently-cased spelling names the same file.
 func Reserved(path string, caseInsensitive bool) bool {
 	p := path
 	if caseInsensitive {
@@ -142,17 +143,19 @@ func Reserved(path string, caseInsensitive bool) bool {
 	if p == TrashDir || strings.HasPrefix(p, TrashDir+"/") {
 		return true
 	}
-	if strings.HasPrefix(p[strings.LastIndexByte(p, '/')+1:], TempPrefix) {
-		return true
+	for _, seg := range strings.Split(p, "/") {
+		if strings.HasPrefix(seg, TempPrefix) {
+			return true
+		}
 	}
 	return p == MarkerName || strings.HasPrefix(p, MarkerName+".tmp-")
 }
 
 func checkSegment(path, seg string, p Platform) error {
-	if len(seg) > MaxComponent {
-		return blocked(path, fmt.Sprintf("component longer than %d bytes", MaxComponent))
-	}
 	if !p.Windows {
+		if len(seg) > MaxComponent {
+			return blocked(path, fmt.Sprintf("component longer than %d bytes", MaxComponent))
+		}
 		return nil
 	}
 	if n := len(utf16.Encode([]rune(seg))); n > MaxComponent {

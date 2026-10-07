@@ -28,6 +28,8 @@ func TestInvalidEverywhere(t *testing.T) {
 		".tendrils-root.tmp-1",
 		".tendrils-trash/a.md",
 		"notes/.tendrils-tmp-123",
+		".tendrils-tmp-dir/file.txt",
+		"a/.tendrils-tmp-x/b/c.md",
 	} {
 		for _, plat := range []Platform{linux, windows} {
 			if err := Check(p, plat); !errors.Is(err, ErrInvalid) {
@@ -65,7 +67,7 @@ func TestBlockedOnWindowsOnly(t *testing.T) {
 		"ctrl\x01char",
 		"PROGRA~1/x",
 		"REPORT~2.TXT",
-		"dir/" + strings.Repeat("é", 200),
+		"dir/" + strings.Repeat("é", MaxComponent+1),
 	} {
 		err := Check(p, windows)
 		if !Blocked(err) {
@@ -93,9 +95,17 @@ func TestComponentLength(t *testing.T) {
 			t.Errorf("256-byte component not blocked on %+v", plat)
 		}
 	}
-	// 127 two-byte runes: 254 bytes and 127 UTF-16 units — valid on both.
-	if err := Check(strings.Repeat("é", 127), windows); err != nil {
-		t.Errorf("multibyte name within limits: %v", err)
+	// 200 two-byte runes: 400 bytes but 200 UTF-16 units.
+	wide := strings.Repeat("é", 200)
+	if err := Check(wide, windows); err != nil {
+		t.Errorf("windows limit is UTF-16 units, not bytes: %v", err)
+	}
+	if !Blocked(Check(wide, linux)) {
+		t.Error("linux limit is bytes: 400-byte component not blocked")
+	}
+	// One astral rune is 4 bytes and 2 UTF-16 units: 128 of them is 256 units.
+	if !Blocked(Check(strings.Repeat("𝄞", 128), windows)) {
+		t.Error("256 UTF-16 units not blocked on windows")
 	}
 }
 

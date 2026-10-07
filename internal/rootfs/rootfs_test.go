@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -220,5 +221,56 @@ func TestUnicodeAndLongNamesRoundTrip(t *testing.T) {
 	info, err := f.Lstat(long)
 	if err != nil || !info.ModTime().Equal(mtime) {
 		t.Fatalf("mtime %v, %v", info, err)
+	}
+}
+
+func TestCaseMismatchRecheckedAtCommit(t *testing.T) {
+	root, _, id := enrolled(t)
+	f := open(t, root, id)
+	f.SetPlatform(syncpath.Platform{CaseInsensitive: true})
+	p, err := f.Create("a.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Abort()
+	p.Write([]byte("pulled"))
+	// Another spelling appears while the download is still staging.
+	if err := os.WriteFile(filepath.Join(root, "A.txt"), []byte("owner's"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Commit(time.Time{}); !errors.Is(err, ErrCaseMismatch) {
+		t.Fatalf("commit = %v, want ErrCaseMismatch", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(root, "A.txt")); string(b) != "owner's" {
+		t.Fatalf("differently-spelled file overwritten: %q", b)
+	}
+}
+
+// A user's own file spelled like the marker in capitals is a different file on
+// a case-sensitive root, and must not make the root look case-insensitive.
+func TestUppercaseMarkerFileDoesNotFoolCaseProbe(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("creating it would overwrite the marker on a case-insensitive volume")
+	}
+	root, _, id := enrolled(t)
+	upper := filepath.Join(root, strings.ToUpper(rootid.MarkerName))
+	if _, err := os.Lstat(upper); err == nil {
+		t.Skip("temp dir is case-insensitive")
+	}
+	if err := os.WriteFile(upper, []byte("mine"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if open(t, root, id).Platform().CaseInsensitive {
+		t.Fatal("case-sensitive root probed as case-insensitive")
+	}
+}
+
+func TestLstatRefusesNonDirectoryParent(t *testing.T) {
+	root, outside, id := enrolled(t)
+	if err := os.Symlink(outside, filepath.Join(root, "notes")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, err := open(t, root, id).Lstat("notes/victim.txt"); !errors.Is(err, ErrNotConfined) {
+		t.Fatalf("Lstat through symlink parent = %v, want ErrNotConfined", err)
 	}
 }
