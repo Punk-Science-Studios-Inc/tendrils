@@ -154,6 +154,11 @@ func (p *Pool) Upload(ctx context.Context, data []byte) (Descriptor, error) {
 // only one holding a given blob — so the search continues. ErrNotFound comes back
 // only when every server was asked and none had it.
 func (p *Pool) Download(ctx context.Context, sha256 string) ([]byte, error) {
+	return p.DownloadSize(ctx, sha256, 0)
+}
+
+// DownloadSize is Download for a blob whose exact size is known.
+func (p *Pool) DownloadSize(ctx context.Context, sha256 string, size int64) ([]byte, error) {
 	clients := p.order()
 	if len(clients) == 0 {
 		return nil, errors.New("blob: no Blossom servers configured")
@@ -161,7 +166,7 @@ func (p *Pool) Download(ctx context.Context, sha256 string) ([]byte, error) {
 	var errs []error
 	sawNotFound := false
 	for _, c := range clients {
-		data, err := c.Download(ctx, sha256)
+		data, err := c.DownloadSize(ctx, sha256, size)
 		if err == nil {
 			p.markUp(c)
 			return data, nil

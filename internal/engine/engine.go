@@ -61,7 +61,9 @@ type EventStore interface {
 // BlobStore is the file-content side. *blob.Client satisfies it directly.
 type BlobStore interface {
 	Upload(ctx context.Context, data []byte) (blob.Descriptor, error)
-	Download(ctx context.Context, sha256 string) ([]byte, error)
+	// DownloadSize fetches a blob that must be exactly size bytes (unknown if
+	// size <= 0, in which case the store bounds it itself).
+	DownloadSize(ctx context.Context, sha256 string, size int64) ([]byte, error)
 	// Has reports whether the store already holds this blob at this exact size.
 	// The size is what makes a skipped upload safe — see blob.Client.Has.
 	Has(ctx context.Context, sha256 string, size int64) (bool, error)
@@ -837,7 +839,7 @@ func (e *Engine) writeRemoteChunked(ctx context.Context, path string, remote *tr
 
 	sum := sha256.New()
 	for i, c := range remote.Chunks {
-		sealed, err := e.blobs.Download(ctx, c.BlobHash)
+		sealed, err := e.blobs.DownloadSize(ctx, c.BlobHash, c.Size)
 		if err != nil {
 			if errors.Is(err, blob.ErrNotFound) {
 				return fmt.Errorf("chunk %d of %d (%s…) for %q is not on the configured Blossom server: this device is likely pointed at a different or empty server than the one holding your files — check --blossom / the blossom_servers in your config", i+1, len(remote.Chunks), short(c.BlobHash), path)
@@ -898,7 +900,7 @@ func (e *Engine) writeRemote(ctx context.Context, path string, remote *tree.Entr
 	if remote.BlobHash == "" {
 		return fmt.Errorf("remote entry has no blob address")
 	}
-	sealed, err := e.blobs.Download(ctx, remote.BlobHash)
+	sealed, err := e.blobs.DownloadSize(ctx, remote.BlobHash, sealedSize(remote))
 	if err != nil {
 		if errors.Is(err, blob.ErrNotFound) {
 			return fmt.Errorf("blob %s… for %q is not on the configured Blossom server: this device is likely pointed at a different or empty server than the one holding your files — check --blossom / the blossom_servers in your config", short(remote.BlobHash), path)
@@ -1018,6 +1020,18 @@ func supersedes(a, b *nostr.Event) bool {
 	}
 	return a.ID < b.ID
 }
+
+// sealedSize is the exact size a single-blob entry's blob must have, or 0 when
+// the event does not say (a size tag missing from a non-empty file), in which
+// case the store's own bound applies.
+func sealedSize(e *tree.Entry) int64 {
+	if e.Size == 0 && e.Sha256 != emptySha256 {
+		return 0
+	}
+	return e.Size + crypt.Overhead
+}
+
+const emptySha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 // observed is the destination state a plan was made against.
 func observed(local *tree.Entry) rootfs.Expect {

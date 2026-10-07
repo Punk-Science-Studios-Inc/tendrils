@@ -28,6 +28,10 @@ import (
 // nonceSize is the standard GCM nonce length in bytes.
 const nonceSize = 12
 
+// Overhead is how many bytes sealing adds: the nonce and the GCM tag. A sealed
+// blob of plaintext n is exactly n+Overhead bytes, under either nonce scheme.
+const Overhead = nonceSize + 16
+
 // nonceDomain separates this derivation from any other use of the same key.
 const nonceDomain = "tendrils/crypt/nonce/v1"
 

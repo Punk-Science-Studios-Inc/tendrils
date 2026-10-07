@@ -2,11 +2,13 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"ca.punkscience.tendrils/internal/blob"
 	"ca.punkscience.tendrils/internal/index"
 	"ca.punkscience.tendrils/internal/rootid"
 	"ca.punkscience.tendrils/internal/syncpath"
@@ -131,5 +133,28 @@ func TestRecoveryPausesOnAnUnavailableRoot(t *testing.T) {
 	}
 	if got, _ := readFile(t, root, "a.md"); got != "v1" {
 		t.Errorf("a.md = %q, want it untouched", got)
+	}
+}
+
+// A download that stalls leaves the file as it was, journals nothing and stays
+// pending under a transient backoff.
+func TestStalledDownloadLeavesFileAndStaysPending(t *testing.T) {
+	eng, root, ev, bl := syncedFile(t, "a.md", "v1", t0)
+	seedRemote(t, ev, bl, eng.id, "a.md", "v2", t0.Add(time.Minute))
+	bl.failDownload = blob.ErrStalled
+
+	if err := eng.Sync(context.Background()); !errors.Is(err, blob.ErrStalled) {
+		t.Fatalf("sync = %v, want the stall reported", err)
+	}
+	if got, _ := readFile(t, root, "a.md"); got != "v1" {
+		t.Errorf("a.md = %q, want the original", got)
+	}
+	if ops, _ := eng.idx.Journal(); len(ops) != 0 {
+		t.Errorf("journal = %v", ops)
+	}
+	assertNoStagingIn(t, root)
+	r, _ := eng.idx.Retries()
+	if rr := r["a.md"]; rr.Failures != 1 || rr.Permanent {
+		t.Errorf("retry = %+v, want one transient failure", rr)
 	}
 }

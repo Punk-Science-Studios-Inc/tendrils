@@ -57,6 +57,20 @@ var ErrNotFound = errors.New("blob: not found")
 // the next pass cannot possibly succeed: the same bytes will be refused again.
 var ErrTooLarge = errors.New("blob: too large for server")
 
+// ErrStalled is returned when a response body stops arriving for StallTimeout.
+// Transient: the next attempt, or the next server, may well get through.
+var ErrStalled = errors.New("blob: transfer stalled")
+
+// ErrWrongSize is returned when a blob is not the size it must be, or exceeds
+// the limit for a blob of unknown size. The download is discarded unread.
+var ErrWrongSize = errors.New("blob: wrong size")
+
+// Defaults for a Client's download bounds.
+const (
+	DefaultStallTimeout = 60 * time.Second
+	DefaultMaxBytes     = 2 << 30
+)
+
 // maxErrBody caps how much of a server's error body is quoted back in an error.
 const maxErrBody = 200
 
@@ -98,6 +112,27 @@ type Client struct {
 	server string // base URL, no trailing slash
 	id     *keys.Identity
 	http   *http.Client
+
+	// StallTimeout is how long a response body may deliver nothing before the
+	// transfer is abandoned. Zero means DefaultStallTimeout.
+	StallTimeout time.Duration
+	// MaxBytes bounds a download whose size is not known in advance. Zero means
+	// DefaultMaxBytes.
+	MaxBytes int64
+}
+
+func (c *Client) stallTimeout() time.Duration {
+	if c.StallTimeout > 0 {
+		return c.StallTimeout
+	}
+	return DefaultStallTimeout
+}
+
+func (c *Client) maxBytes() int64 {
+	if c.MaxBytes > 0 {
+		return c.MaxBytes
+	}
+	return DefaultMaxBytes
 }
 
 // New returns a Client for server, authorizing as id. Its HTTP client uses
@@ -177,14 +212,24 @@ func (c *Client) Upload(ctx context.Context, data []byte) (Descriptor, error) {
 	return d, nil
 }
 
-// Download fetches the blob at sha256 and verifies the bytes hash back to it, so
-// a wrong or corrupted response never reaches the caller. Returns ErrNotFound
-// when the server has no such blob.
+// Download fetches the blob at sha256 when its size is not known in advance. It
+// is bounded by MaxBytes rather than trusting the server to say how large it is.
 func (c *Client) Download(ctx context.Context, sha256 string) ([]byte, error) {
+	return c.DownloadSize(ctx, sha256, 0)
+}
+
+// DownloadSize fetches the blob at sha256, which must be exactly size bytes
+// (unknown if size <= 0, in which case MaxBytes bounds it), and verifies the
+// bytes hash back to the address, so a wrong, short, long or corrupted response
+// never reaches the caller. Returns ErrNotFound when the server has no such blob,
+// and ErrStalled when the body stops arriving for StallTimeout.
+func (c *Client) DownloadSize(ctx context.Context, sha256 string, size int64) ([]byte, error) {
 	auth, err := c.authHeader("get", sha256)
 	if err != nil {
 		return nil, err
 	}
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.server+"/"+sha256, nil)
 	if err != nil {
@@ -206,14 +251,59 @@ func (c *Client) Download(ctx context.Context, sha256 string) ([]byte, error) {
 		return nil, newStatusError(resp.StatusCode, "blob: download failed (%s)%s", resp.Status, detail(msg))
 	}
 
-	data, err := io.ReadAll(resp.Body)
+	limit := size
+	if limit <= 0 {
+		limit = c.maxBytes()
+	}
+	if resp.ContentLength > limit || size > 0 && resp.ContentLength >= 0 && resp.ContentLength != size {
+		return nil, fmt.Errorf("blob: %s… is %d bytes, want %s: %w", sha256[:min(12, len(sha256))], resp.ContentLength, sizeWant(size, limit), ErrWrongSize)
+	}
+
+	body := &progressReader{r: resp.Body, timer: time.AfterFunc(c.stallTimeout(), func() { cancel(ErrStalled) }), d: c.stallTimeout()}
+	defer body.timer.Stop()
+	buf := make([]byte, 0, min(limit, 1<<20))
+	if size > 0 {
+		buf = make([]byte, 0, size)
+	}
+	w := bytes.NewBuffer(buf)
+	n, err := io.Copy(w, io.LimitReader(body, limit+1))
 	if err != nil {
+		if errors.Is(context.Cause(ctx), ErrStalled) {
+			return nil, fmt.Errorf("blob: download from %s: no data for %s: %w", c.server, c.stallTimeout(), ErrStalled)
+		}
 		return nil, fmt.Errorf("blob: read blob body: %w", err)
 	}
+	if n > limit || size > 0 && n != size {
+		return nil, fmt.Errorf("blob: %s… delivered %d bytes, want %s: %w", sha256[:min(12, len(sha256))], n, sizeWant(size, limit), ErrWrongSize)
+	}
+	data := w.Bytes()
 	if got := hashHex(data); got != sha256 {
 		return nil, fmt.Errorf("blob: integrity check failed: got %s want %s", got, sha256)
 	}
 	return data, nil
+}
+
+func sizeWant(size, limit int64) string {
+	if size > 0 {
+		return strconv.FormatInt(size, 10)
+	}
+	return "at most " + strconv.FormatInt(limit, 10)
+}
+
+// progressReader pushes a deadline back every time bytes arrive, so a transfer
+// is cut off only when it stops moving, never for being large or slow.
+type progressReader struct {
+	r     io.Reader
+	timer *time.Timer
+	d     time.Duration
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	if n > 0 {
+		p.timer.Reset(p.d)
+	}
+	return n, err
 }
 
 // Has reports whether the server holds the blob at sha256 *and* that it is

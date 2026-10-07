@@ -71,6 +71,8 @@ type fakeBlobs struct {
 	// onDownload runs inside every Download, standing in for the time a slow
 	// transfer gives the owner to touch the destination.
 	onDownload func()
+	// failDownload, when set, is what every Download returns.
+	failDownload error
 }
 
 func newFakeBlobs() *fakeBlobs { return &fakeBlobs{data: map[string][]byte{}} }
@@ -88,13 +90,19 @@ func (f *fakeBlobs) Has(_ context.Context, sha256 string, size int64) (bool, err
 	return ok && int64(len(b)) == size, nil
 }
 
-func (f *fakeBlobs) Download(_ context.Context, sha256 string) ([]byte, error) {
+func (f *fakeBlobs) DownloadSize(_ context.Context, sha256 string, size int64) ([]byte, error) {
 	if f.onDownload != nil {
 		f.onDownload()
+	}
+	if f.failDownload != nil {
+		return nil, f.failDownload
 	}
 	b, ok := f.data[sha256]
 	if !ok {
 		return nil, blob.ErrNotFound
+	}
+	if size > 0 && int64(len(b)) != size {
+		return nil, blob.ErrWrongSize
 	}
 	return append([]byte(nil), b...), nil
 }
