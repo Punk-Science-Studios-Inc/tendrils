@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"ca.punkscience.tendrils/internal/rootfs"
 )
 
 // bigContent builds a deterministic body of n bytes that is not uniform, so a
@@ -127,7 +129,7 @@ func TestChunkedTruncatedListIsRejected(t *testing.T) {
 	engB := newEngine(t, rootB, id, ev, bl)
 	engB.chunkSize = 1000
 	openPass(t, engB)
-	err = engB.writeRemote(context.Background(), "music/big.flac", remote, false)
+	err = engB.writeRemote(context.Background(), "music/big.flac", remote, rootfs.ExpectAbsent(), false)
 	if err == nil {
 		t.Fatal("truncated chunk list was accepted, want integrity failure")
 	}
