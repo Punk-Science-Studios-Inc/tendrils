@@ -89,6 +89,7 @@ func localSnapshot(id *keys.Identity) (statusSnapshot, error) {
 	snap.Deferred = stats.Deferred
 	snap.Unavailable = stats.Unavailable
 	snap.Blocked = stats.Blocked
+	snap.Recovering = stats.Recovering
 	snap.Paused = stats.Paused
 	return snap, nil
 }
@@ -118,6 +119,11 @@ func computeStatus(store *index.Store, root string, rootID rootid.Identity, excl
 	if err != nil {
 		return
 	}
+	journal, err := store.Journal()
+	if err != nil {
+		return
+	}
+	stats.Recovering = len(journal)
 	now := time.Now()
 	for _, r := range retries {
 		if r.NextAttempt.After(now) {
@@ -232,6 +238,9 @@ func printStatus(out io.Writer, snap statusSnapshot, daemonRunning bool) {
 	}
 	if snap.Blocked > 0 {
 		fmt.Fprintf(out, "Blocked:         %d (cannot be represented on this device; left untouched, still synced elsewhere)\n", snap.Blocked)
+	}
+	if snap.Recovering > 0 {
+		fmt.Fprintf(out, "Interrupted:     %d (unfinished writes or trashes; finished before the next pass syncs those paths)\n", snap.Recovering)
 	}
 	if snap.Deferred > 0 {
 		fmt.Fprintf(out, "Stuck:           %d (repeatedly failed, waiting out a retry backoff)\n", snap.Deferred)

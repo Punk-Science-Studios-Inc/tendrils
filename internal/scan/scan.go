@@ -67,6 +67,10 @@ type Result struct {
 	// UTF-8, or a bookkeeping name in another case — with the reason. A blocked
 	// directory blocks everything beneath it.
 	Blocked map[string]string
+	// Staged lists staging files found in the tree: downloads in flight when a
+	// pass was interrupted. Never synced; the engine keeps the journaled ones and
+	// removes the rest.
+	Staged []string
 }
 
 // Gap is a root-relative path the scan could not observe: an unreadable
@@ -171,6 +175,9 @@ func Walk(fsys *rootfs.FS, opt Options) (Result, error) {
 		if rel != "." && Reserved(rel) {
 			if d.IsDir() {
 				return fs.SkipDir
+			}
+			if strings.HasPrefix(d.Name(), TempPrefix) && d.Type().IsRegular() {
+				res.Staged = append(res.Staged, rel)
 			}
 			return nil
 		}

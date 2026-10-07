@@ -8,17 +8,22 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"ca.punkscience.tendrils/internal/rootid"
 )
 
-func mountTmpfs(t *testing.T, dir string) {
+func mountTmpfs(t *testing.T, dir string) { mountTmpfsSized(t, dir, "8m") }
+
+func mountTmpfsSized(t *testing.T, dir, size string) {
 	t.Helper()
-	if err := syscall.Mount("tendrils-test", dir, "tmpfs", 0, "size=8m"); err != nil {
+	if err := syscall.Mount("tendrils-test", dir, "tmpfs", 0, "size="+size); err != nil {
 		t.Skipf("cannot mount (run under the documented unshare harness): %v", err)
 	}
 	t.Cleanup(func() { syscall.Unmount(dir, syscall.MNT_DETACH) })
@@ -91,4 +96,79 @@ func TestMountSubordinateMountIsGuarded(t *testing.T) {
 	if stats.Unavailable != 1 {
 		t.Errorf("unavailable = %d after unmount, want the boundary still held", stats.Unavailable)
 	}
+}
+
+// A full disk while staging a download leaves the original, no journal record
+// and no staging file: nothing was promised, so nothing needs recovering.
+func TestMountDiskFullWhileStaging(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "drive")
+	if err := os.Mkdir(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mountTmpfsSized(t, root, "1m")
+	ev, bl := newFakeEvents(), newFakeBlobs()
+	writeFile(t, root, "a.md", "v1", t0)
+	eng := newEngine(t, root, mustID(t), ev, bl)
+	if err := eng.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	seedRemote(t, ev, bl, eng.id, "a.md", strings.Repeat("x", 2<<20), t0.Add(time.Minute))
+
+	err := eng.Sync(context.Background())
+	if err == nil || !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("sync = %v, want ENOSPC", err)
+	}
+	if got, _ := readFile(t, root, "a.md"); got != "v1" {
+		t.Errorf("a.md = %.20q, want the original", got)
+	}
+	if ops, _ := eng.idx.Journal(); len(ops) != 0 {
+		t.Errorf("journal = %v, want nothing recorded", ops)
+	}
+	assertBase(t, eng.idx, "a.md", "v1")
+	assertNoStagingIn(t, root)
+}
+
+// A full disk while preserving the losing version leaves the original and the
+// verified download in place; the pull finishes once there is room.
+func TestMountDiskFullWhilePreserving(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "drive")
+	if err := os.Mkdir(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mountTmpfsSized(t, root, "1m")
+	ev, bl := newFakeEvents(), newFakeBlobs()
+	writeFile(t, root, "a.md", "v1", t0)
+	eng := newEngine(t, root, mustID(t), ev, bl)
+	if err := eng.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	loser := strings.Repeat("l", 400<<10)
+	winner := strings.Repeat("w", 400<<10)
+	writeFile(t, root, "a.md", loser, t0.Add(10*time.Second))
+	seedRemote(t, ev, bl, eng.id, "a.md", winner, t0.Add(time.Minute))
+
+	if err := eng.Sync(context.Background()); !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("sync = %v, want ENOSPC", err)
+	}
+	if got, _ := readFile(t, root, "a.md"); got != loser {
+		t.Error("the losing version was replaced before it was preserved")
+	}
+	if ops, _ := eng.idx.Journal(); len(ops) != 1 {
+		t.Fatalf("journal = %v, want the pull held", ops)
+	}
+
+	if err := syscall.Mount("tendrils-test", root, "tmpfs", syscall.MS_REMOUNT, "size=4m"); err != nil {
+		t.Fatal(err)
+	}
+	eng.idx.ClearRetry("a.md")
+	if err := eng.Sync(context.Background()); err != nil {
+		t.Fatalf("sync with room: %v", err)
+	}
+	if got, _ := readFile(t, root, "a.md"); got != winner {
+		t.Error("a.md is not the winner once there was room")
+	}
+	if got, _ := readFile(t, root, onlyConflictCopy(t, root, "a.md")); got != loser {
+		t.Error("conflict copy does not hold the loser")
+	}
+	assertNoStagingIn(t, root)
 }

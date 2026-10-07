@@ -99,6 +99,8 @@ type Engine struct {
 	// platform, when set, replaces the root's probed naming rules. Tests use it to
 	// exercise Windows rules on Linux.
 	platform *syncpath.Platform
+	// faultHook is called at each persisted stage of a mutation, for crash tests.
+	faultHook func(stage, path string)
 }
 
 // OnProgress registers a callback invoked as each planned action begins and once
@@ -125,6 +127,9 @@ type Stats struct {
 	// platform cannot represent, and names that collide by case. They are left
 	// untouched here and keep syncing everywhere else.
 	Blocked int
+	// Recovering counts interrupted operations that could not be finished yet.
+	// Their paths are left alone until they are.
+	Recovering int
 	// Paused says why no work was done at all — the root is missing, is not the
 	// enrolled folder, or the ignore rules cannot be read. Empty when syncing.
 	Paused string
@@ -207,6 +212,21 @@ func (e *Engine) Sync(ctx context.Context) error {
 		fsys.Close()
 		e.fs = nil
 	}()
+	retries, err := e.idx.Retries()
+	if err != nil {
+		return fmt.Errorf("engine: read retry state: %w", err)
+	}
+	recovering, err := e.recover(retries, time.Now())
+	if err != nil {
+		var gone *rootid.Unavailable
+		if errors.As(err, &gone) {
+			return e.pause(err)
+		}
+		return fmt.Errorf("engine: recover: %w", err)
+	}
+	if retries, err = e.idx.Retries(); err != nil {
+		return fmt.Errorf("engine: read retry state: %w", err)
+	}
 	// The ignore file (.tendrilsignore at the root) is itself a synced file, read
 	// fresh each pass so edits take effect without a restart. Unreadable rules
 	// pause the pass: guessing them empty would publish what they hide.
@@ -235,13 +255,10 @@ func (e *Engine) Sync(ctx context.Context) error {
 			return fmt.Errorf("engine: record mounts: %w", err)
 		}
 	}
+	e.discardOrphans(scanned.Staged)
 	remote, remoteComplete, err := e.fetchRemote(ctx)
 	if err != nil {
 		return fmt.Errorf("engine: fetch remote: %w", err)
-	}
-	retries, err := e.idx.Retries()
-	if err != nil {
-		return fmt.Errorf("engine: read retry state: %w", err)
 	}
 
 	// Plan first, so the total is known before any action runs — that count is
@@ -264,6 +281,10 @@ func (e *Engine) Sync(ctx context.Context) error {
 		// A path this device cannot represent is left exactly as it is, here and
 		// on the relay. It is never tombstoned for being absent.
 		if blocked.holds(path) {
+			continue
+		}
+		// An unfinished operation owns its path until it is finished.
+		if recovering[path] {
 			continue
 		}
 		// A path the scan could not see is unknown, not deleted, and nothing may
@@ -314,6 +335,10 @@ func (e *Engine) Sync(ctx context.Context) error {
 	if stats.Unavailable > 0 {
 		e.log.Warn("parts of the tree could not be observed; nothing under them is synced or deleted",
 			"unavailable", stats.Unavailable, "examples", unseen.examples(3))
+	}
+	stats.Recovering = len(recovering)
+	if stats.Recovering > 0 {
+		e.log.Warn("interrupted operations are still unfinished; their paths are held", "count", stats.Recovering)
 	}
 	stats.Blocked = len(blocked.reasons)
 	if stats.Blocked > 0 {
@@ -832,23 +857,7 @@ func (e *Engine) writeRemoteChunked(ctx context.Context, path string, remote *tr
 	if got := hex.EncodeToString(sum.Sum(nil)); got != remote.Sha256 {
 		return fmt.Errorf("decrypted content %s does not match expected %s", got, remote.Sha256)
 	}
-	return e.replace(tmp, path, remote, want, conflictCopy)
-}
-
-// replace puts a verified download in place, but only over the file the plan was
-// made against. A destination edited, created or deleted while the download ran
-// fails with rootfs.ErrChanged and is left alone for the next pass to judge. A
-// losing local version is preserved first; if that fails, nothing is replaced.
-func (e *Engine) replace(tmp *rootfs.Pending, path string, remote *tree.Entry, want rootfs.Expect, conflictCopy bool) error {
-	if conflictCopy && !want.Absent {
-		if _, err := e.preserveConflictCopy(path, want); err != nil {
-			return fmt.Errorf("preserve conflict copy: %w", err)
-		}
-	}
-	if err := tmp.CommitIf(remote.ModTime, want); err != nil {
-		return fmt.Errorf("write: %w", err)
-	}
-	return e.idx.Put(remote)
+	return e.land(tmp, path, remote, want, conflictCopy)
 }
 
 // uploadIfAbsent stores sealed and returns its content address, skipping the
@@ -912,17 +921,7 @@ func (e *Engine) writeRemote(ctx context.Context, path string, remote *tree.Entr
 	if _, err := tmp.Write(plaintext); err != nil {
 		return fmt.Errorf("write: %w", err)
 	}
-	return e.replace(tmp, path, remote, want, conflictCopy)
-}
-
-// deleteLocal moves the local file to the trash (recoverable for the retention
-// window) and records the remote tombstone as the new base. A file changed since
-// the scan is left for the next pass.
-func (e *Engine) deleteLocal(path string, want rootfs.Expect) error {
-	if err := e.fs.TrashIf(path, want); err != nil {
-		return fmt.Errorf("trash: %w", err)
-	}
-	return e.idx.Put(&tree.Entry{Path: path, Deleted: true, ModTime: time.Now()})
+	return e.land(tmp, path, remote, want, conflictCopy)
 }
 
 // publishDelete announces a local deletion as a tombstone and records it.
@@ -1018,14 +1017,6 @@ func supersedes(a, b *nostr.Event) bool {
 		return a.CreatedAt > b.CreatedAt
 	}
 	return a.ID < b.ID
-}
-
-// preserveConflictCopy copies the observed local file to a new conflict-marked
-// sibling that will itself sync on the next pass, so the owner sees the losing
-// version on every device and resolves it with a rename. Each copy gets a name
-// of its own, so a later conflict never overwrites an earlier one.
-func (e *Engine) preserveConflictCopy(path string, want rootfs.Expect) (string, error) {
-	return e.fs.Preserve(path, want, func() string { return conflictCopyPath(path, e.id.PublicHex(), time.Now()) })
 }
 
 // observed is the destination state a plan was made against.
