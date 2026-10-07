@@ -19,6 +19,7 @@ var (
 	metaBucket    = []byte("meta")
 	retriesBucket = []byte("retries")
 	mountsBucket  = []byte("mounts")
+	blockedBucket = []byte("blocked")
 	lastReconcile = []byte("last-reconcile")
 )
 
@@ -50,7 +51,7 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("index: open %s: %w", path, err)
 	}
 	err = db.Update(func(tx *bbolt.Tx) error {
-		for _, b := range [][]byte{entriesBucket, metaBucket, retriesBucket, mountsBucket} {
+		for _, b := range [][]byte{entriesBucket, metaBucket, retriesBucket, mountsBucket, blockedBucket} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -219,5 +220,40 @@ func (s *Store) ResetMounts() error {
 		}
 		_, err := tx.CreateBucket(mountsBucket)
 		return err
+	})
+}
+
+// Blocked returns the paths the last pass could not sync on this device, with
+// the reason for each. It is what status reports when no daemon is running.
+func (s *Store) Blocked() (map[string]string, error) {
+	out := make(map[string]string)
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		return tx.Bucket(blockedBucket).ForEach(func(k, v []byte) error {
+			out[string(k)] = string(v)
+			return nil
+		})
+	})
+	return out, err
+}
+
+// SetBlocked replaces the recorded blocked paths with paths.
+func (s *Store) SetBlocked(paths map[string]string) error {
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		if err := tx.DeleteBucket(blockedBucket); err != nil {
+			return err
+		}
+		b, err := tx.CreateBucket(blockedBucket)
+		if err != nil {
+			return err
+		}
+		for p, reason := range paths {
+			if p == "" || len(p) > bbolt.MaxKeySize {
+				continue
+			}
+			if err := b.Put([]byte(p), []byte(reason)); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 }

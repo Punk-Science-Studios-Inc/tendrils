@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -11,6 +12,7 @@ import (
 	"ca.punkscience.tendrils/internal/engine"
 	"ca.punkscience.tendrils/internal/index"
 	"ca.punkscience.tendrils/internal/keys"
+	"ca.punkscience.tendrils/internal/rootfs"
 	"ca.punkscience.tendrils/internal/rootid"
 	"ca.punkscience.tendrils/internal/scan"
 	"ca.punkscience.tendrils/internal/tree"
@@ -86,6 +88,7 @@ func localSnapshot(id *keys.Identity) (statusSnapshot, error) {
 	snap.Conflicts = stats.Conflicts
 	snap.Deferred = stats.Deferred
 	snap.Unavailable = stats.Unavailable
+	snap.Blocked = stats.Blocked
 	snap.Paused = stats.Paused
 	return snap, nil
 }
@@ -124,11 +127,13 @@ func computeStatus(store *index.Store, root string, rootID rootid.Identity, excl
 	if root == "" {
 		return
 	}
-	if verr := rootid.Verify(root, rootID); verr != nil {
+	fsys, verr := rootfs.OpenVerified(root, rootID)
+	if verr != nil {
 		stats.Paused = verr.Error()
 		return
 	}
-	ign, ierr := engine.IgnoreMatcher(root, exclude)
+	defer fsys.Close()
+	ign, ierr := engine.IgnoreMatcher(fsys, exclude)
 	if ierr != nil {
 		stats.Paused = ierr.Error()
 		return
@@ -137,9 +142,23 @@ func computeStatus(store *index.Store, root string, rootID rootid.Identity, excl
 	if err != nil {
 		return
 	}
-	scanned, err := scan.Tree(root, scan.Options{Base: base, Ignore: ign, Mounts: mounts})
+	scanned, err := scan.Walk(fsys, scan.Options{Base: base, Ignore: ign, Mounts: mounts})
 	if err != nil {
 		return
+	}
+	// Paths blocked by what only the relay knows (a name another device published
+	// that this one cannot represent) come from the last daemon pass.
+	blocked, err := store.Blocked()
+	if err != nil {
+		return
+	}
+	for p, reason := range scanned.Blocked {
+		blocked[p] = reason
+	}
+	for p := range blocked {
+		if !ign.Match(p) && !ign.PruneDir(p) {
+			stats.Blocked++
+		}
 	}
 	local, cov := scanned.Entries, scanned.Coverage
 	known := make([]string, 0, len(local)+len(base))
@@ -154,7 +173,7 @@ func computeStatus(store *index.Store, root string, rootID rootid.Identity, excl
 	stats.Unavailable = engine.CountUnavailable(cov, ign, known)
 
 	for path, e := range local {
-		if !cov.Observed(path) {
+		if !cov.Observed(path) || isBlocked(blocked, path) {
 			continue
 		}
 		if ign.Match(path) {
@@ -169,7 +188,7 @@ func computeStatus(store *index.Store, root string, rootID rootid.Identity, excl
 		}
 	}
 	for path, b := range base {
-		if !b.Live() || ign.Match(path) || !cov.Observed(path) {
+		if !b.Live() || ign.Match(path) || !cov.Observed(path) || isBlocked(blocked, path) {
 			continue
 		}
 		if _, stillHere := local[path]; !stillHere {
@@ -177,6 +196,20 @@ func computeStatus(store *index.Store, root string, rootID rootid.Identity, excl
 		}
 	}
 	return
+}
+
+// isBlocked reports whether path, or a directory above it, is blocked.
+func isBlocked(blocked map[string]string, path string) bool {
+	for p := path; ; {
+		if _, ok := blocked[p]; ok {
+			return true
+		}
+		i := strings.LastIndexByte(p, '/')
+		if i < 0 {
+			return false
+		}
+		p = p[:i]
+	}
 }
 
 func printStatus(out io.Writer, snap statusSnapshot, daemonRunning bool) {
@@ -196,6 +229,9 @@ func printStatus(out io.Writer, snap statusSnapshot, daemonRunning bool) {
 	fmt.Fprintln(out, "Conflicts:     ", snap.Conflicts)
 	if snap.Unavailable > 0 {
 		fmt.Fprintf(out, "Unavailable:     %d (could not be read; held back, never treated as deleted)\n", snap.Unavailable)
+	}
+	if snap.Blocked > 0 {
+		fmt.Fprintf(out, "Blocked:         %d (cannot be represented on this device; left untouched, still synced elsewhere)\n", snap.Blocked)
 	}
 	if snap.Deferred > 0 {
 		fmt.Fprintf(out, "Stuck:           %d (repeatedly failed, waiting out a retry backoff)\n", snap.Deferred)

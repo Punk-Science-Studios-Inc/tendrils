@@ -64,3 +64,33 @@ func TestComputeStatusAppliesExclude(t *testing.T) {
 		t.Fatalf("with exclude: pending=%d, want 0", stats.Pending)
 	}
 }
+
+// Paths the last daemon pass found unrepresentable are reported by the
+// daemonless status too, and are not counted as pending.
+func TestComputeStatusReportsBlocked(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("TENDRILS_HOME", home)
+	store, err := index.Open(filepath.Join(home, "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	root := t.TempDir()
+	rid, err := rootid.Establish(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetBlocked(map[string]string{"CON.txt": "reserved Windows device name", "music/x": "excluded"}); err != nil {
+		t.Fatal(err)
+	}
+	_, stats, err := computeStatus(store, root, rid, []string{"music/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Blocked != 1 {
+		t.Fatalf("blocked = %d, want 1 (excluded paths are not reported)", stats.Blocked)
+	}
+	if stats.Pending != 0 {
+		t.Fatalf("pending = %d, want 0", stats.Pending)
+	}
+}

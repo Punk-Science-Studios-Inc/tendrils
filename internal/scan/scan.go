@@ -12,29 +12,23 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"os"
-	"path/filepath"
 	"strings"
 
 	"ca.punkscience.tendrils/internal/ignore"
-	"ca.punkscience.tendrils/internal/rootid"
+	"ca.punkscience.tendrils/internal/rootfs"
+	"ca.punkscience.tendrils/internal/syncpath"
 	"ca.punkscience.tendrils/internal/tree"
 )
 
 // TrashDir is the sync-root-relative folder where deleted files are retained.
 // It is Tendrils' own bookkeeping and is never itself synced.
-const TrashDir = ".tendrils-trash"
+const TrashDir = syncpath.TrashDir
 
 // TempPrefix is the basename prefix of the temp files atomicWrite creates in the
 // target's directory before renaming into place. They live inside the sync root,
 // so scan must skip them by prefix: a crash between write and rename leaves one
 // behind, and it must never be mistaken for a real file and published.
-const TempPrefix = ".tendrils-tmp-"
-
-// isTempFile reports whether a path's basename is an atomic-write temp file.
-func isTempFile(rel string) bool {
-	return strings.HasPrefix(filepath.Base(rel), TempPrefix)
-}
+const TempPrefix = syncpath.TempPrefix
 
 // ConflictMarker is embedded in the filename of a preserved losing version when
 // two devices diverge. A conflict copy stays in the tree and syncs like any
@@ -43,7 +37,7 @@ const ConflictMarker = ".tendrils-conflict-"
 
 // IsConflictCopy reports whether a path is a preserved conflict copy.
 func IsConflictCopy(path string) bool {
-	return strings.Contains(filepath.Base(path), ConflictMarker)
+	return strings.Contains(path[strings.LastIndexByte(path, '/')+1:], ConflictMarker)
 }
 
 // Options shapes a scan.
@@ -69,6 +63,10 @@ type Options struct {
 type Result struct {
 	Entries  map[string]*tree.Entry
 	Coverage Coverage
+	// Blocked holds names on disk that cannot be synced from here — not valid
+	// UTF-8, or a bookkeeping name in another case — with the reason. A blocked
+	// directory blocks everything beneath it.
+	Blocked map[string]string
 }
 
 // Gap is a root-relative path the scan could not observe: an unreadable
@@ -135,7 +133,18 @@ func (c *Coverage) add(path, reason string) {
 // unreadable folder neither stalls the rest of the tree nor reads as a deletion.
 // Only a root that cannot be read at all is an error.
 func Tree(root string, opt Options) (Result, error) {
-	res := Result{Entries: make(map[string]*tree.Entry)}
+	fsys, err := rootfs.Open(root)
+	if err != nil {
+		return Result{}, fmt.Errorf("scan: %w", err)
+	}
+	defer fsys.Close()
+	return Walk(fsys, opt)
+}
+
+// Walk is Tree over an already-open root. Every read goes through fsys, so a
+// symlink or junction swapped in mid-walk cannot lead the scan outside the root.
+func Walk(fsys *rootfs.FS, opt Options) (Result, error) {
+	res := Result{Entries: make(map[string]*tree.Entry), Blocked: make(map[string]string)}
 	cov := &res.Coverage
 	known := make(map[string]bool, len(opt.Mounts))
 	for _, m := range opt.Mounts {
@@ -143,17 +152,12 @@ func Tree(root string, opt Options) (Result, error) {
 		cov.Mounts = append(cov.Mounts, m)
 		cov.add(m, "subordinate mount point")
 	}
-	rootInfo, err := os.Stat(root)
+	rootInfo, err := fs.Stat(fsys.FS(), ".")
 	if err != nil {
 		return Result{}, fmt.Errorf("scan: %w", err)
 	}
 
-	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		rel, relErr := filepath.Rel(root, path)
-		if relErr != nil {
-			return relErr
-		}
-		rel = filepath.ToSlash(rel)
+	err = fs.WalkDir(fsys.FS(), ".", func(rel string, d fs.DirEntry, err error) error {
 		if err != nil {
 			if rel == "." || d == nil {
 				return err
@@ -169,6 +173,15 @@ func Tree(root string, opt Options) (Result, error) {
 				return fs.SkipDir
 			}
 			return nil
+		}
+		if rel != "." {
+			if cerr := fsys.Check(rel); cerr != nil {
+				res.Blocked[rel] = cerr.Error()
+				if d.IsDir() {
+					return fs.SkipDir
+				}
+				return nil
+			}
 		}
 
 		if d.IsDir() {
@@ -211,7 +224,7 @@ func Tree(root string, opt Options) (Result, error) {
 			res.Entries[rel] = e
 			return nil
 		}
-		entry, err := hashFile(path, rel)
+		entry, err := hashFile(fsys, rel)
 		if err != nil {
 			cov.add(rel, err.Error())
 			return nil
@@ -220,7 +233,7 @@ func Tree(root string, opt Options) (Result, error) {
 		return nil
 	})
 	if err != nil {
-		return Result{}, fmt.Errorf("scan: walk %s: %w", root, err)
+		return Result{}, fmt.Errorf("scan: walk %s: %w", fsys.Path(), err)
 	}
 	return res, nil
 }
@@ -228,15 +241,7 @@ func Tree(root string, opt Options) (Result, error) {
 // Reserved reports whether a root-relative path is Tendrils' own bookkeeping:
 // the trash, an atomic-write temp file, or the root marker. Such a path is never
 // scanned, published, pulled or deleted, whichever side names it.
-func Reserved(rel string) bool {
-	if rel == TrashDir || strings.HasPrefix(rel, TrashDir+"/") {
-		return true
-	}
-	if isTempFile(rel) {
-		return true
-	}
-	return rel == rootid.MarkerName || strings.HasPrefix(rel, rootid.MarkerName+".tmp-")
-}
+func Reserved(rel string) bool { return syncpath.Reserved(rel, false) }
 
 // reuse returns a scan entry taken from base when the on-disk file's size and
 // mtime still match it, so its stored content hash can be trusted without
@@ -259,11 +264,16 @@ func reuse(base *tree.Entry, rel string, info fs.FileInfo) *tree.Entry {
 
 // HashFile computes the entry (path, sha256, size, mtime) for a single file.
 func HashFile(root, rel string) (*tree.Entry, error) {
-	return hashFile(filepath.Join(root, filepath.FromSlash(rel)), rel)
+	fsys, err := rootfs.Open(root)
+	if err != nil {
+		return nil, fmt.Errorf("scan: %w", err)
+	}
+	defer fsys.Close()
+	return hashFile(fsys, rel)
 }
 
-func hashFile(abs, rel string) (*tree.Entry, error) {
-	f, err := os.Open(abs)
+func hashFile(fsys *rootfs.FS, rel string) (*tree.Entry, error) {
+	f, err := fsys.Open(rel)
 	if err != nil {
 		return nil, fmt.Errorf("scan: open %s: %w", rel, err)
 	}

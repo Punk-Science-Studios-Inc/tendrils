@@ -29,10 +29,12 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"ca.punkscience.tendrils/internal/syncpath"
 )
 
 // MarkerName is the root-relative name of the marker file.
-const MarkerName = ".tendrils-root"
+const MarkerName = syncpath.MarkerName
 
 // Identity is what enrollment records about a root.
 type Identity struct {

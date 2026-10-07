@@ -23,6 +23,8 @@ Built and tested (`go test ./...` green):
 | `internal/index` | bbolt store of the last-synced `Entry` per path (the reconcile "base") + last-reconcile time. Retains tombstones. Also holds per-path **`Retry`** state (failure count, next-attempt time, cause, permanent flag) in its own bucket — created on open, so an index from an older build upgrades in place. |
 | `internal/scan` | Walk the sync root → `Entry` map (sha256, mtime) **plus `Coverage`**: unreadable folders, unreadable files, unsupported entries (symlinks, junctions) and subordinate mounts become `Gap`s instead of failing the scan. Ignored files are never opened; a directory is pruned only when no later `!` rule could re-include anything beneath it (`ignore.PruneDir`). Skips Tendrils bookkeeping (`Reserved`: trash, temp files, root marker); conflict-copy naming (`ConflictMarker`). |
 | `internal/rootid` | Sync-root identity: a `.tendrils-root` marker (random ID) plus the filesystem ID (Linux `f_fsid`, Windows volume serial), recorded in `config.json` at enroll/adopt. `Verify` is run before every pass and every destructive action. See "An absent root is not an empty tree" below. |
+| `internal/syncpath` | Pure wire-path validator. **Invalid** (absolute/drive paths, traversal, empty segments, NUL, bad UTF-8, bookkeeping names) vs **blocked** on this platform (Windows reserved names, `:` streams, forbidden characters, trailing dot/space, 8.3 aliases, components > 255). `Collisions` finds case-only clashes of whole paths or parent dirs. Owns the bookkeeping names. See "Every path goes through the root handle" below. |
+| `internal/rootfs` | The only way sync code touches the tree: an `os.Root` opened per pass. Validates every path, refuses non-directory parents (symlinks, junctions), re-verifies root identity and that the path still leads to the held directory before every mutation, and on a case-insensitive root refuses a write whose components exist in another case. Atomic `Create`/`Commit`/`Abort`, `WriteFile`, `Trash`. |
 | `internal/ignore` | gitignore-style matcher (`.tendrilsignore` subset: `#`, `!`, trailing `/`, anchored, `* ? **`). Used for both the **shared** synced ignore file and each node's **local** `exclude` patterns — see "Per-node exclusions" below. |
 | `internal/nostrevent` | `Entry` ⇄ Nostr event codec. Parameterized replaceable event, kind `31337`, `d`=path, `x`=sha256, `mtime`/`deleted` tags. **`created_at` = publication time, not mtime** — see "Two clocks" below. Signs/verifies. |
 | `internal/config` | State dir (`$TENDRILS_HOME` or OS config dir), local `config.json` (overrides discovery, plus the per-node **`exclude`** patterns), device key at rest (0600 file — deliberately not a keychain). |
@@ -131,6 +133,33 @@ enumerated in a different order can therefore read as "another filesystem" and
 pause until it is adopted again. That is a false pause, never a false delete.
 Real-mount tests live behind `-tags mountintegration` (see
 `internal/engine/mount_linux_test.go` for the `unshare` harness, and the CI job).
+
+## Every path goes through the root handle
+
+`internal/syncpath`, `internal/rootfs`. A wire path is a name another device
+signed, so it is input, not a filename. Before this, `filepath.Join(root, path)`
+would follow `../outside/x` out of the folder, and a symlink or junction swapped
+in above a target would carry a write wherever it pointed.
+
+- **One boundary.** Engine, scan, status, `adopt` and `repair` all read and
+  write through `rootfs`. Nothing in sync code joins a root path by hand.
+- **Invalid is not blocked.** An invalid name is never acted on anywhere. A
+  blocked one is valid elsewhere: this device leaves it alone, the relay keeps
+  it, other devices keep syncing it. Both count in `Stats.Blocked`, are recorded
+  in the index's `blocked` bucket (so daemonless `status` sees them), and are
+  **never tombstoned** for being absent here. Names are never rewritten or
+  renamed automatically.
+- **Case.** The root is probed (the marker in another case) rather than assumed
+  from the OS: Linux mounts exFAT/VFAT case-insensitively. On such a root, names
+  that would be live after the pass and fold together — as whole paths or as
+  parent dirs — are all blocked. A tombstoned spelling does not count, so a
+  case-only rename applies; removals run before writes in a pass for the same
+  reason. Folding is `strings.ToLower`, not NTFS's upcase table.
+- **Not covered.** `os.Root` follows a symlink that stays inside the root; the
+  parent check catches the ordinary case but not a race inside the root (it can
+  never escape). Unicode normalization (NFC vs NFD) is not folded. exFAT on
+  Linux also rejects Windows' forbidden characters; such a write fails and backs
+  off rather than being blocked up front.
 
 ## A read that failed is not an empty set
 
