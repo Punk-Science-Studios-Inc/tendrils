@@ -20,7 +20,7 @@ Built and tested (`go test ./...` green):
 | `internal/keys` | Parse nsec/hex, derive the AES-256 blob key via HKDF-SHA256 (domain-separated, no salt so it is reproducible from the key alone). |
 | `internal/crypt` | Blob encryption at rest: AES-256-GCM, `nonce‖ciphertext`. The nonce is **deterministic** — SIV-style, `HMAC-SHA256(key, domain‖plaintext)[:12]` — so the same file under the same key always seals to the same bytes and therefore the same Blossom address. |
 | `internal/reconcile` | The pure conflict decision: LWW-by-mtime, delete-is-absolute, re-creation-honoured, conflict copies. Delete-is-absolute now includes **tombstone re-assertion**: a base tombstone facing a live remote entry no newer than it republishes the tombstone rather than pulling the file back, so a concurrent edit that displaced the delete on the relay cannot resurrect it. One test per Gherkin scenario. **The correctness-critical heart.** |
-| `internal/index` | bbolt store of the last-synced `Entry` per path (the reconcile "base") + last-reconcile time. Retains tombstones. Also holds per-path **`Retry`** state (failure count, next-attempt time, cause, permanent flag) in its own bucket — created on open, so an index from an older build upgrades in place. |
+| `internal/index` | bbolt store of the last-synced `Entry` per path (the reconcile "base") + last-reconcile time. Retains tombstones. Also holds per-path **`Retry`** state (failure count, next-attempt time, cause, permanent flag) in its own bucket, and the **mutation journal** (`Op`, one per path; `Complete` writes the base and clears the record in one transaction). Versioned by `meta/schema` (`index.Schema`): an older index is upgraded in place, a newer one is refused. |
 | `internal/scan` | Walk the sync root → `Entry` map (sha256, mtime) **plus `Coverage`**: unreadable folders, unreadable files, unsupported entries (symlinks, junctions) and subordinate mounts become `Gap`s instead of failing the scan. Ignored files are never opened; a directory is pruned only when no later `!` rule could re-include anything beneath it (`ignore.PruneDir`). Skips Tendrils bookkeeping (`Reserved`: trash, temp files, root marker); conflict-copy naming (`ConflictMarker`). |
 | `internal/rootid` | Sync-root identity: a `.tendrils-root` marker (random ID) plus the filesystem ID (Linux `f_fsid`, Windows volume serial), recorded in `config.json` at enroll/adopt. `Verify` is run before every pass and every destructive action. See "An absent root is not an empty tree" below. |
 | `internal/syncpath` | Pure wire-path validator. **Invalid** (absolute/drive paths, traversal, empty segments, NUL, bad UTF-8, bookkeeping names) vs **blocked** on this platform (Windows reserved names, `:` streams, forbidden characters, trailing dot/space, 8.3 aliases, components > 255). `Collisions` finds case-only clashes of whole paths or parent dirs. Owns the bookkeeping names. See "Every path goes through the root handle" below. |
@@ -92,6 +92,41 @@ may not be the file the decision was made about.
   none, it checks then renames. `Preserve` streams the copy, re-checks the
   source after copying, and never leaves a partial copy under a synced name. If
   preservation fails, the original is not replaced.
+
+## Interrupted operations are finished, not guessed
+
+`internal/engine/journal.go`, `index.Op`. Every pull and trash is journaled
+before anything at the path changes, and the base is written in the **same bbolt
+transaction** that clears the record — so the index never certifies a file that
+was not put in place.
+
+- **Order:** stage → fsync → stamp mtime → journal → (preserve) → rename →
+  fsync dir → `Complete`. Trash: journal (destination fixed up front) → rename →
+  fsync both dirs → `Complete`. The conflict-copy name is fixed in the record, so
+  a retried pull never makes a second copy.
+- **One code path.** `resume` is both the live path and recovery. Each step first
+  looks for evidence it already happened: staging gone + destination hashes to
+  the target ⇒ promoted; source gone + trash destination present ⇒ trashed.
+- **Recovery runs first in every pass**, before scanning. A record it cannot
+  finish holds its path (counted in `Stats.Recovering`, shown by `status` as
+  "Interrupted") and obeys retry backoff. An unavailable root pauses the pass.
+- **Evidence or nothing.** A destination that no longer matches, or a staging
+  file that vanished while the destination does not hold the download, drops
+  the record without touching the base: the next pass decides from the disk.
+  User files are never deleted by recovery; only Tendrils' own staging files are.
+- **Orphaned staging** (cut off before it was journaled) is removed after the
+  scan. Journaled staging is protected. Safe because only one process holds the
+  index.
+- **Durability limits.** Linux/BSD: file and directory fsync. Windows: file
+  flush only — a directory cannot be flushed and the rename is not
+  write-through, so a power cut can lose a rename the index already recorded;
+  the next scan then sees the old file as a local edit with its old mtime, and
+  last-writer-wins keeps the remote and preserves the old file as a conflict
+  copy. A sharing violation on rename is retried `rootfs.RenameAttempts` times
+  with doubling backoff, then left pending.
+- **Crash tests** re-run the test binary as a child (`TestCrashChild`) with
+  `faultHook` exiting at a named stage. Add a fault point for any new persisted
+  stage and add it to the matrix.
 
 ## Publish the hash you uploaded
 `publishLocal` reads the file, seals it, uploads it, and publishes an event describing it. The `Sha256` in that event must be the hash of **the bytes it just read** — never `local.Sha256` from the scan earlier in the same pass.

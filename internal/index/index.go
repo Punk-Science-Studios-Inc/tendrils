@@ -6,7 +6,9 @@ package index
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"go.etcd.io/bbolt"
@@ -20,8 +22,18 @@ var (
 	retriesBucket = []byte("retries")
 	mountsBucket  = []byte("mounts")
 	blockedBucket = []byte("blocked")
+	journalBucket = []byte("journal")
 	lastReconcile = []byte("last-reconcile")
+	schemaKey     = []byte("schema")
 )
+
+// Schema is the state layout this build reads and writes. An index with no
+// recorded schema predates versioning and is upgraded in place by adding what it
+// lacks; one newer than this is refused rather than read wrongly.
+const Schema = 2
+
+// ErrUnsupportedSchema is returned for an index written by a newer build.
+var ErrUnsupportedSchema = errors.New("index was written by a newer version of tendrils")
 
 // Retry is a path's record of consecutive action failures: how many, and the
 // earliest time worth trying again. It exists so one file the server will not
@@ -51,16 +63,23 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("index: open %s: %w", path, err)
 	}
 	err = db.Update(func(tx *bbolt.Tx) error {
-		for _, b := range [][]byte{entriesBucket, metaBucket, retriesBucket, mountsBucket, blockedBucket} {
+		if meta := tx.Bucket(metaBucket); meta != nil {
+			if v := meta.Get(schemaKey); v != nil {
+				if n, err := strconv.Atoi(string(v)); err != nil || n > Schema {
+					return fmt.Errorf("%w (schema %q, this build reads %d)", ErrUnsupportedSchema, v, Schema)
+				}
+			}
+		}
+		for _, b := range [][]byte{entriesBucket, metaBucket, retriesBucket, mountsBucket, blockedBucket, journalBucket} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
 		}
-		return nil
+		return tx.Bucket(metaBucket).Put(schemaKey, []byte(strconv.Itoa(Schema)))
 	})
 	if err != nil {
 		db.Close()
-		return nil, fmt.Errorf("index: init buckets: %w", err)
+		return nil, fmt.Errorf("index: open %s: %w", path, err)
 	}
 	return &Store{db: db}, nil
 }

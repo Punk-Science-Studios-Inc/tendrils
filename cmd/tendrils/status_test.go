@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"ca.punkscience.tendrils/internal/index"
@@ -92,5 +93,36 @@ func TestComputeStatusReportsBlocked(t *testing.T) {
 	}
 	if stats.Pending != 0 {
 		t.Fatalf("pending = %d, want 0", stats.Pending)
+	}
+}
+
+// An interrupted operation is reported without a daemon, and printed.
+func TestComputeStatusReportsInterruptedOperations(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("TENDRILS_HOME", home)
+	store, err := index.Open(filepath.Join(home, "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	root := t.TempDir()
+	rid, err := rootid.Establish(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Begin(index.Op{Kind: index.OpTrash, Path: "a.md", Final: &tree.Entry{Path: "a.md", Deleted: true}}); err != nil {
+		t.Fatal(err)
+	}
+	_, stats, err := computeStatus(store, root, rid, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Recovering != 1 {
+		t.Fatalf("recovering = %d, want 1", stats.Recovering)
+	}
+	var out strings.Builder
+	printStatus(&out, statusSnapshot{Recovering: stats.Recovering}, false)
+	if !strings.Contains(out.String(), "Interrupted:     1") {
+		t.Errorf("status output does not report it:\n%s", out.String())
 	}
 }

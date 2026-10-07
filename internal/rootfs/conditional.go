@@ -68,7 +68,14 @@ func (p *Pending) CommitIf(mtime time.Time, want Expect) error {
 	if err := p.f.Unchanged(p.rel, want); err != nil {
 		return err
 	}
-	return p.Commit(mtime)
+	if _, err := p.Seal(mtime); err != nil {
+		return err
+	}
+	if err := p.f.promote(p.tmp, p.rel, &want); err != nil {
+		return err
+	}
+	p.tmp = ""
+	return nil
 }
 
 // CommitNew is Commit for a name that must not already exist. Where hard links
@@ -99,17 +106,16 @@ func (p *Pending) CommitNew(mtime time.Time) error {
 	}
 	if err == nil {
 		p.f.root.Remove(p.tmp)
-		p.tmp = ""
-		return nil
-	}
-	if _, statErr := p.f.root.Lstat(p.rel); !errors.Is(statErr, fs.ErrNotExist) {
-		return &fs.PathError{Op: "create", Path: p.rel, Err: fs.ErrExist}
-	}
-	if err := p.f.root.Rename(p.tmp, p.rel); err != nil {
-		return err
+	} else {
+		if _, statErr := p.f.root.Lstat(p.rel); !errors.Is(statErr, fs.ErrNotExist) {
+			return &fs.PathError{Op: "create", Path: p.rel, Err: fs.ErrExist}
+		}
+		if err := p.f.root.Rename(p.tmp, p.rel); err != nil {
+			return err
+		}
 	}
 	p.tmp = ""
-	return nil
+	return p.f.syncDir(path.Dir(p.rel))
 }
 
 // Preserve copies rel to a new sibling name, streaming through a fixed buffer so

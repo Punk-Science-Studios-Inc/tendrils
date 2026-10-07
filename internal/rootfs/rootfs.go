@@ -308,29 +308,50 @@ func (p *Pending) Write(b []byte) (int, error) { return p.file.Write(b) }
 
 // Commit stamps the file's mtime (unless zero) and renames it over rel.
 func (p *Pending) Commit(mtime time.Time) error {
-	if err := p.close(); err != nil {
+	if _, err := p.Seal(mtime); err != nil {
 		return err
 	}
-	if !mtime.IsZero() {
-		if err := p.f.root.Chtimes(p.tmp, time.Now(), mtime); err != nil {
-			return err
-		}
-	}
-	if err := p.f.Verify(); err != nil {
-		return err
-	}
-	if err := p.f.confined(p.rel); err != nil {
-		return err
-	}
-	if err := p.f.spelled(p.rel); err != nil {
-		return err
-	}
-	if err := p.f.root.Rename(p.tmp, p.rel); err != nil {
+	if err := p.f.promote(p.tmp, p.rel, nil); err != nil {
 		return err
 	}
 	p.tmp = ""
 	return nil
 }
+
+// Staged describes a sealed staging file as it was left on disk.
+type Staged struct {
+	Path    string
+	Size    int64
+	ModTime time.Time
+}
+
+// Seal flushes the staged bytes to stable storage, closes the file and stamps
+// its mtime (unless zero). The file stays where it is until promoted.
+func (p *Pending) Seal(mtime time.Time) (Staged, error) {
+	if !p.closed {
+		if err := p.file.Sync(); err != nil {
+			p.close()
+			return Staged{}, err
+		}
+	}
+	if err := p.close(); err != nil {
+		return Staged{}, err
+	}
+	if !mtime.IsZero() {
+		if err := p.f.root.Chtimes(p.tmp, time.Now(), mtime); err != nil {
+			return Staged{}, err
+		}
+	}
+	info, err := p.f.root.Lstat(p.tmp)
+	if err != nil {
+		return Staged{}, err
+	}
+	return Staged{Path: p.tmp, Size: info.Size(), ModTime: info.ModTime()}, nil
+}
+
+// Release hands the staging file over to the caller's own bookkeeping: Abort
+// no longer removes it.
+func (p *Pending) Release() { p.tmp = "" }
 
 // Abort discards an uncommitted write. It is a no-op after Commit.
 func (p *Pending) Abort() {
@@ -367,18 +388,5 @@ func (f *FS) Trash(rel string) error {
 	if err := f.Check(rel); err != nil {
 		return err
 	}
-	dst := syncpath.TrashDir + "/" + rel
-	if err := f.prepareParent(dst, false); err != nil {
-		return err
-	}
-	if err := f.confined(rel); err != nil {
-		return err
-	}
-	if err := f.spelled(rel); err != nil {
-		return err
-	}
-	if _, err := f.root.Lstat(dst); err == nil {
-		dst = fmt.Sprintf("%s.%d", dst, time.Now().UnixNano())
-	}
-	return f.root.Rename(rel, dst)
+	return f.trashTo(rel, f.TrashName(rel), nil)
 }
