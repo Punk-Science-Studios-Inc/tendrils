@@ -16,6 +16,7 @@ package engine
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -361,6 +362,10 @@ func (e *Engine) Sync(ctx context.Context) error {
 		if errors.As(err, &gone) {
 			return errors.Join(append(errs, e.pause(err))...)
 		}
+		if errors.Is(err, rootfs.ErrChanged) {
+			e.log.Info("changed during the pass; deciding again next pass", "path", a.path, "op", a.decision.Op.String(), "err", err)
+			continue
+		}
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", a.path, err))
 			e.log.Error("action failed", "path", a.path, "op", a.decision.Op.String(), "err", err)
@@ -679,9 +684,9 @@ func (e *Engine) execute(ctx context.Context, path string, d reconcile.Decision,
 	case reconcile.OpPublishLocal:
 		return e.publishLocal(ctx, local)
 	case reconcile.OpWriteRemote:
-		return e.writeRemote(ctx, path, remote, d.ConflictCopy)
+		return e.writeRemote(ctx, path, remote, observed(local), d.ConflictCopy)
 	case reconcile.OpDeleteLocal:
-		return e.deleteLocal(path)
+		return e.deleteLocal(path, observed(local))
 	case reconcile.OpPublishDelete:
 		return e.publishDelete(ctx, path)
 	default:
@@ -798,7 +803,7 @@ func (e *Engine) publishLocalChunked(ctx context.Context, local *tree.Entry) err
 // rather than the whole file. The plaintext hash is accumulated across chunks
 // and checked before anything is put in place: a truncated or reordered chunk
 // list fails the check and the temp file is discarded.
-func (e *Engine) writeRemoteChunked(ctx context.Context, path string, remote *tree.Entry, conflictCopy bool) error {
+func (e *Engine) writeRemoteChunked(ctx context.Context, path string, remote *tree.Entry, want rootfs.Expect, conflictCopy bool) error {
 	tmp, err := e.fs.Create(path)
 	if err != nil {
 		return fmt.Errorf("write: %w", err)
@@ -827,12 +832,20 @@ func (e *Engine) writeRemoteChunked(ctx context.Context, path string, remote *tr
 	if got := hex.EncodeToString(sum.Sum(nil)); got != remote.Sha256 {
 		return fmt.Errorf("decrypted content %s does not match expected %s", got, remote.Sha256)
 	}
-	if conflictCopy {
-		if err := e.preserveConflictCopy(path); err != nil {
+	return e.replace(tmp, path, remote, want, conflictCopy)
+}
+
+// replace puts a verified download in place, but only over the file the plan was
+// made against. A destination edited, created or deleted while the download ran
+// fails with rootfs.ErrChanged and is left alone for the next pass to judge. A
+// losing local version is preserved first; if that fails, nothing is replaced.
+func (e *Engine) replace(tmp *rootfs.Pending, path string, remote *tree.Entry, want rootfs.Expect, conflictCopy bool) error {
+	if conflictCopy && !want.Absent {
+		if _, err := e.preserveConflictCopy(path, want); err != nil {
 			return fmt.Errorf("preserve conflict copy: %w", err)
 		}
 	}
-	if err := tmp.Commit(remote.ModTime); err != nil {
+	if err := tmp.CommitIf(remote.ModTime, want); err != nil {
 		return fmt.Errorf("write: %w", err)
 	}
 	return e.idx.Put(remote)
@@ -869,9 +882,9 @@ func (e *Engine) uploadIfAbsent(ctx context.Context, sealed []byte) (string, err
 // writeRemote pulls the remote blob, unseals it, and writes it to disk. If the
 // local file carried an unpublished change, it is preserved as a conflict copy
 // first — a wrong last-writer-wins guess then costs a rename, never data.
-func (e *Engine) writeRemote(ctx context.Context, path string, remote *tree.Entry, conflictCopy bool) error {
+func (e *Engine) writeRemote(ctx context.Context, path string, remote *tree.Entry, want rootfs.Expect, conflictCopy bool) error {
 	if remote.Chunked() {
-		return e.writeRemoteChunked(ctx, path, remote, conflictCopy)
+		return e.writeRemoteChunked(ctx, path, remote, want, conflictCopy)
 	}
 	if remote.BlobHash == "" {
 		return fmt.Errorf("remote entry has no blob address")
@@ -891,21 +904,22 @@ func (e *Engine) writeRemote(ctx context.Context, path string, remote *tree.Entr
 		return fmt.Errorf("decrypted content %s does not match expected %s", got, remote.Sha256)
 	}
 
-	if conflictCopy {
-		if err := e.preserveConflictCopy(path); err != nil {
-			return fmt.Errorf("preserve conflict copy: %w", err)
-		}
-	}
-	if err := e.fs.WriteFile(path, plaintext, remote.ModTime); err != nil {
+	tmp, err := e.fs.Create(path)
+	if err != nil {
 		return fmt.Errorf("write: %w", err)
 	}
-	return e.idx.Put(remote)
+	defer tmp.Abort()
+	if _, err := tmp.Write(plaintext); err != nil {
+		return fmt.Errorf("write: %w", err)
+	}
+	return e.replace(tmp, path, remote, want, conflictCopy)
 }
 
 // deleteLocal moves the local file to the trash (recoverable for the retention
-// window) and records the remote tombstone as the new base.
-func (e *Engine) deleteLocal(path string) error {
-	if err := e.moveToTrash(path); err != nil {
+// window) and records the remote tombstone as the new base. A file changed since
+// the scan is left for the next pass.
+func (e *Engine) deleteLocal(path string, want rootfs.Expect) error {
+	if err := e.fs.TrashIf(path, want); err != nil {
 		return fmt.Errorf("trash: %w", err)
 	}
 	return e.idx.Put(&tree.Entry{Path: path, Deleted: true, ModTime: time.Now()})
@@ -1006,23 +1020,21 @@ func supersedes(a, b *nostr.Event) bool {
 	return a.ID < b.ID
 }
 
-// preserveConflictCopy copies the current local file to a conflict-marked
+// preserveConflictCopy copies the observed local file to a new conflict-marked
 // sibling that will itself sync on the next pass, so the owner sees the losing
-// version on every device and resolves it with a rename.
-func (e *Engine) preserveConflictCopy(path string) error {
-	data, err := e.fs.ReadFile(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil // nothing local to preserve
-		}
-		return err
-	}
-	return e.fs.WriteFile(conflictCopyPath(path, e.id.PublicHex()), data, time.Now())
+// version on every device and resolves it with a rename. Each copy gets a name
+// of its own, so a later conflict never overwrites an earlier one.
+func (e *Engine) preserveConflictCopy(path string, want rootfs.Expect) (string, error) {
+	return e.fs.Preserve(path, want, func() string { return conflictCopyPath(path, e.id.PublicHex(), time.Now()) })
 }
 
-// moveToTrash relocates a file under the sync root's trash directory, preserving
-// its relative structure; a name clash is disambiguated with a timestamp.
-func (e *Engine) moveToTrash(path string) error { return e.fs.Trash(path) }
+// observed is the destination state a plan was made against.
+func observed(local *tree.Entry) rootfs.Expect {
+	if local == nil || local.Deleted {
+		return rootfs.ExpectAbsent()
+	}
+	return rootfs.Expect{Size: local.Size, ModTime: local.ModTime}
+}
 
 // loadIgnore reads the sync root's .tendrilsignore into a matcher.
 func (e *Engine) loadIgnore() (*ignore.Matcher, error) {
@@ -1079,14 +1091,17 @@ func unionPaths(maps ...map[string]*tree.Entry) []string {
 	return out
 }
 
-// conflictCopyPath inserts the conflict marker (plus a short device tag, so
-// copies from two devices do not collide) before a path's extension.
-func conflictCopyPath(p, pubkey string) string {
+// conflictCopyPath inserts the conflict marker, a short key tag, a timestamp and
+// a random suffix before a path's extension. Devices sharing one key share the
+// tag, so the time and randomness are what keep their copies apart.
+func conflictCopyPath(p, pubkey string, now time.Time) string {
 	tag := pubkey
 	if len(tag) > 8 {
 		tag = tag[:8]
 	}
+	var r [4]byte
+	rand.Read(r[:])
 	ext := path.Ext(p)
 	stem := strings.TrimSuffix(p, ext)
-	return stem + scan.ConflictMarker + tag + ext
+	return stem + scan.ConflictMarker + tag + "-" + now.UTC().Format("20060102T150405Z") + "-" + hex.EncodeToString(r[:]) + ext
 }

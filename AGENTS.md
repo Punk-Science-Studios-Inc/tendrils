@@ -24,7 +24,7 @@ Built and tested (`go test ./...` green):
 | `internal/scan` | Walk the sync root → `Entry` map (sha256, mtime) **plus `Coverage`**: unreadable folders, unreadable files, unsupported entries (symlinks, junctions) and subordinate mounts become `Gap`s instead of failing the scan. Ignored files are never opened; a directory is pruned only when no later `!` rule could re-include anything beneath it (`ignore.PruneDir`). Skips Tendrils bookkeeping (`Reserved`: trash, temp files, root marker); conflict-copy naming (`ConflictMarker`). |
 | `internal/rootid` | Sync-root identity: a `.tendrils-root` marker (random ID) plus the filesystem ID (Linux `f_fsid`, Windows volume serial), recorded in `config.json` at enroll/adopt. `Verify` is run before every pass and every destructive action. See "An absent root is not an empty tree" below. |
 | `internal/syncpath` | Pure wire-path validator. **Invalid** (absolute/drive paths, traversal, empty segments, NUL, bad UTF-8, bookkeeping names) vs **blocked** on this platform (Windows reserved names, `:` streams, forbidden characters, trailing dot/space, 8.3 aliases, components > 255). `Collisions` finds case-only clashes of whole paths or parent dirs. Owns the bookkeeping names. See "Every path goes through the root handle" below. |
-| `internal/rootfs` | The only way sync code touches the tree: an `os.Root` opened per pass. Validates every path, refuses non-directory parents (symlinks, junctions), re-verifies root identity and that the path still leads to the held directory before every mutation, and on a case-insensitive root refuses a write whose components exist in another case. Atomic `Create`/`Commit`/`Abort`, `WriteFile`, `Trash`. |
+| `internal/rootfs` | The only way sync code touches the tree: an `os.Root` opened per pass. Validates every path, refuses non-directory parents (symlinks, junctions), re-verifies root identity and that the path still leads to the held directory before every mutation, and on a case-insensitive root refuses a write whose components exist in another case. Atomic `Create`/`Commit`/`Abort`, `WriteFile`, `Trash`. **Conditional** `CommitIf`/`TrashIf` (refuse with `ErrChanged` if the destination no longer matches the scan's size+mtime), exclusive `CommitNew`, and streaming `Preserve` — see "Replace only what you planned against" below. |
 | `internal/ignore` | gitignore-style matcher (`.tendrilsignore` subset: `#`, `!`, trailing `/`, anchored, `* ? **`). Used for both the **shared** synced ignore file and each node's **local** `exclude` patterns — see "Per-node exclusions" below. |
 | `internal/nostrevent` | `Entry` ⇄ Nostr event codec. Parameterized replaceable event, kind `31337`, `d`=path, `x`=sha256, `mtime`/`deleted` tags. **`created_at` = publication time, not mtime** — see "Two clocks" below. Signs/verifies. |
 | `internal/config` | State dir (`$TENDRILS_HOME` or OS config dir), local `config.json` (overrides discovery, plus the per-node **`exclude`** patterns), device key at rest (0600 file — deliberately not a keychain). |
@@ -70,6 +70,28 @@ the relay still references the blobs from the devices that kept syncing them.
 deleted path does not read as forever-pending. A change to `exclude` needs a
 daemon restart (patterns are captured at startup, though the matcher is compiled
 per pass); a change to `.tendrilsignore` does not.
+
+## Replace only what you planned against
+
+`rootfs.Expect`, `CommitIf`, `TrashIf`, `Preserve`. A pass scans, then
+downloads, then replaces. A download can take minutes, so the file it replaces
+may not be the file the decision was made about.
+
+- **Every replacement and trash is conditional** on the destination still
+  matching the scan's observation (absent, or the same size+mtime — the identity
+  the scan itself trusts). A mismatch returns `rootfs.ErrChanged`: nothing is
+  replaced, no index entry is written, no retry backoff is recorded, and the
+  next pass decides again with the new state.
+- **The window is narrowed, not closed.** The check runs immediately before the
+  rename; a writer in between is still replaced. No filesystem here offers a
+  portable compare-and-swap rename. On Windows a file held open without delete
+  sharing makes the rename fail, which leaves the original and the work pending.
+- **Conflict copies are unique and exclusive.** The name carries the key tag, a
+  UTC timestamp and random bits, because devices sharing a key share the tag.
+  `CommitNew` creates it with a hard link (exclusive); on FAT/exFAT, which has
+  none, it checks then renames. `Preserve` streams the copy, re-checks the
+  source after copying, and never leaves a partial copy under a synced name. If
+  preservation fails, the original is not replaced.
 
 ## Publish the hash you uploaded
 `publishLocal` reads the file, seals it, uploads it, and publishes an event describing it. The `Sha256` in that event must be the hash of **the bytes it just read** — never `local.Sha256` from the scan earlier in the same pass.

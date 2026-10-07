@@ -68,6 +68,9 @@ func (f *fakeEvents) Fetch(_ context.Context, _ string) ([]*nostr.Event, bool, e
 type fakeBlobs struct {
 	data    map[string][]byte
 	uploads int
+	// onDownload runs inside every Download, standing in for the time a slow
+	// transfer gives the owner to touch the destination.
+	onDownload func()
 }
 
 func newFakeBlobs() *fakeBlobs { return &fakeBlobs{data: map[string][]byte{}} }
@@ -86,6 +89,9 @@ func (f *fakeBlobs) Has(_ context.Context, sha256 string, size int64) (bool, err
 }
 
 func (f *fakeBlobs) Download(_ context.Context, sha256 string) ([]byte, error) {
+	if f.onDownload != nil {
+		f.onDownload()
+	}
 	b, ok := f.data[sha256]
 	if !ok {
 		return nil, blob.ErrNotFound
@@ -551,7 +557,7 @@ func TestConflictCopyPreservesLocalEdit(t *testing.T) {
 	if got, _ := readFile(t, root, "c.md"); got != "remote wins" {
 		t.Errorf("c.md = %q, want %q", got, "remote wins")
 	}
-	conflict := conflictCopyPath("c.md", id.PublicHex())
+	conflict := onlyConflictCopy(t, root, "c.md")
 	if got, ok := readFile(t, root, conflict); !ok || got != "local edit" {
 		t.Errorf("conflict copy %q = %q (present=%v), want %q", conflict, got, ok, "local edit")
 	}
