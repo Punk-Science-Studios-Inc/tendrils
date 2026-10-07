@@ -23,7 +23,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"path/filepath"
+	"path"
 	"sort"
 	"strings"
 	"time"
@@ -37,8 +37,10 @@ import (
 	"ca.punkscience.tendrils/internal/keys"
 	"ca.punkscience.tendrils/internal/nostrevent"
 	"ca.punkscience.tendrils/internal/reconcile"
+	"ca.punkscience.tendrils/internal/rootfs"
 	"ca.punkscience.tendrils/internal/rootid"
 	"ca.punkscience.tendrils/internal/scan"
+	"ca.punkscience.tendrils/internal/syncpath"
 	"ca.punkscience.tendrils/internal/tree"
 )
 
@@ -91,6 +93,11 @@ type Engine struct {
 	// applied after the synced .tendrilsignore, so a device can hide a subtree
 	// from itself without changing what any other device syncs.
 	exclude []string
+	// fs is the root opened for the current pass; nil between passes.
+	fs *rootfs.FS
+	// platform, when set, replaces the root's probed naming rules. Tests use it to
+	// exercise Windows rules on Linux.
+	platform *syncpath.Platform
 }
 
 // OnProgress registers a callback invoked as each planned action begins and once
@@ -113,6 +120,10 @@ type Stats struct {
 	// Unavailable counts paths, and unreadable or unsupported places, the scan
 	// could not observe. Nothing under them is synced or deleted until it can be.
 	Unavailable int
+	// Blocked counts paths this device cannot sync: invalid names, names this
+	// platform cannot represent, and names that collide by case. They are left
+	// untouched here and keep syncing everywhere else.
+	Blocked int
 	// Paused says why no work was done at all — the root is missing, is not the
 	// enrolled folder, or the ignore rules cannot be read. Empty when syncing.
 	Paused string
@@ -183,9 +194,18 @@ func New(root string, rootID rootid.Identity, id *keys.Identity, idx *index.Stor
 // anything is read: an unmounted drive's empty mountpoint scans exactly like a
 // tree whose every file was deleted.
 func (e *Engine) Sync(ctx context.Context) error {
-	if err := e.verifyRoot(); err != nil {
-		return err
+	fsys, err := rootfs.OpenVerified(e.root, e.rootID)
+	if err != nil {
+		return e.pause(err)
 	}
+	if e.platform != nil {
+		fsys.SetPlatform(*e.platform)
+	}
+	e.fs = fsys
+	defer func() {
+		fsys.Close()
+		e.fs = nil
+	}()
 	// The ignore file (.tendrilsignore at the root) is itself a synced file, read
 	// fresh each pass so edits take effect without a restart. Unreadable rules
 	// pause the pass: guessing them empty would publish what they hide.
@@ -203,7 +223,7 @@ func (e *Engine) Sync(ctx context.Context) error {
 	}
 	// The base doubles as the scan's mtime+size cache: unchanged files are not
 	// re-hashed, so a pass over a large tree costs a stat per file, not a full read.
-	scanned, err := scan.Tree(e.root, scan.Options{Base: base, Ignore: ign, Mounts: mounts})
+	scanned, err := scan.Walk(e.fs, scan.Options{Base: base, Ignore: ign, Mounts: mounts})
 	if err != nil {
 		return fmt.Errorf("engine: scan: %w", err)
 	}
@@ -229,13 +249,20 @@ func (e *Engine) Sync(ctx context.Context) error {
 	var plan []plannedAction
 	var withheld int
 	unseen := newUnseen(cov, ign)
-	for _, path := range unionPaths(local, base, remote) {
+	paths := unionPaths(local, base, remote)
+	blocked := blockedPaths(e.fs, ign, paths, scanned.Blocked, cov, base, local, remote)
+	for _, path := range paths {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		// Ignored paths are invisible to reconcile: never published, pulled, or
 		// deleted. Any already-synced copy is left frozen in place, not removed.
-		if scan.Reserved(path) || ign.Match(path) {
+		if ign.Match(path) {
+			continue
+		}
+		// A path this device cannot represent is left exactly as it is, here and
+		// on the relay. It is never tombstoned for being absent.
+		if blocked.holds(path) {
 			continue
 		}
 		// A path the scan could not see is unknown, not deleted, and nothing may
@@ -287,6 +314,14 @@ func (e *Engine) Sync(ctx context.Context) error {
 		e.log.Warn("parts of the tree could not be observed; nothing under them is synced or deleted",
 			"unavailable", stats.Unavailable, "examples", unseen.examples(3))
 	}
+	stats.Blocked = len(blocked.reasons)
+	if stats.Blocked > 0 {
+		e.log.Warn("paths this device cannot sync are left untouched here",
+			"blocked", stats.Blocked, "examples", blocked.examples(3))
+	}
+	if err := e.idx.SetBlocked(blocked.reasons); err != nil {
+		e.log.Warn("could not record blocked paths", "err", err)
+	}
 	e.reportStats(stats)
 
 	// Acting only on what is not in backoff keeps a permanently-failing file from
@@ -301,6 +336,12 @@ func (e *Engine) Sync(ctx context.Context) error {
 	if n := len(plan) - len(todo); n > 0 {
 		e.log.Info("paths held back by retry backoff", "count", n)
 	}
+	// Removals go first. On a case-insensitive root a rename that differs only in
+	// case arrives as a delete of one spelling and a write of the other, and the
+	// write must not land on the file the delete is about to trash.
+	sort.SliceStable(todo, func(i, j int) bool {
+		return todo[i].decision.Op == reconcile.OpDeleteLocal && todo[j].decision.Op != reconcile.OpDeleteLocal
+	})
 
 	total := len(todo)
 	var errs []error
@@ -316,6 +357,10 @@ func (e *Engine) Sync(ctx context.Context) error {
 		e.reportProgress(Progress{Done: i, Total: total, Path: a.path, Op: verb(a.decision.Op)})
 		e.log.Info("reconcile", "path", a.path, "op", a.decision.Op.String(), "reason", a.decision.Reason)
 		err := e.execute(ctx, a.path, a.decision, a.local, a.remote)
+		var gone *rootid.Unavailable
+		if errors.As(err, &gone) {
+			return errors.Join(append(errs, e.pause(err))...)
+		}
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", a.path, err))
 			e.log.Error("action failed", "path", a.path, "op", a.decision.Op.String(), "err", err)
@@ -344,12 +389,101 @@ func (e *Engine) pause(cause error) error {
 	return p
 }
 
-// verifyRoot pauses unless the root is still the enrolled folder.
+// verifyRoot pauses unless the root is still the enrolled folder and the pass's
+// handle still holds it.
 func (e *Engine) verifyRoot() error {
-	if err := rootid.Verify(e.root, e.rootID); err != nil {
+	if err := e.fs.Verify(); err != nil {
 		return e.pause(err)
 	}
 	return nil
+}
+
+// blocked is the set of paths this pass will not act on because this device
+// cannot represent them. A blocked directory holds everything beneath it.
+type blocked struct {
+	reasons map[string]string
+}
+
+// blockedPaths finds every known path that is invalid, unrepresentable here, or
+// — on a case-insensitive root — would share a file or directory with a
+// differently-cased name. Only names that would be live after this pass take
+// part in a collision: a spelling this pass removes or tombstones is about to
+// go, and counting it would block every case-only rename, from either side.
+func blockedPaths(fsys *rootfs.FS, ign *ignore.Matcher, paths []string, scanned map[string]string, cov scan.Coverage, base, local, remote map[string]*tree.Entry) blocked {
+	b := blocked{reasons: make(map[string]string)}
+	for p, reason := range scanned {
+		if !ign.Match(p) && !ign.PruneDir(p) {
+			b.reasons[p] = reason
+		}
+	}
+	var live []string
+	for _, p := range paths {
+		if ign.Match(p) {
+			continue
+		}
+		if err := fsys.Check(p); err != nil {
+			b.reasons[p] = err.Error()
+			continue
+		}
+		if liveAfterPass(cov.Observed(p), base[p], local[p], remote[p]) {
+			live = append(live, p)
+		}
+	}
+	if fsys.Platform().CaseInsensitive {
+		for p, reason := range syncpath.Collisions(live) {
+			b.reasons[p] = reason
+		}
+	}
+	return b
+}
+
+// liveAfterPass reports whether a name will exist after this pass if it is not
+// blocked. An unobserved path is held as it is, so it counts as live if either
+// side has it.
+func liveAfterPass(observed bool, base, local, remote *tree.Entry) bool {
+	if !observed {
+		return local.Live() || remote.Live()
+	}
+	switch reconcile.Decide(base, local, remote).Op {
+	case reconcile.OpWriteRemote, reconcile.OpPublishLocal:
+		return true
+	case reconcile.OpDeleteLocal, reconcile.OpPublishDelete:
+		return false
+	default:
+		return local.Live()
+	}
+}
+
+func (b blocked) holds(p string) bool {
+	if len(b.reasons) == 0 {
+		return false
+	}
+	if _, ok := b.reasons[p]; ok {
+		return true
+	}
+	for i := len(p) - 1; i > 0; i-- {
+		if p[i] == '/' {
+			if _, ok := b.reasons[p[:i]]; ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (b blocked) examples(n int) []string {
+	keys := make([]string, 0, len(b.reasons))
+	for p := range b.reasons {
+		keys = append(keys, p)
+	}
+	sort.Strings(keys)
+	if len(keys) > n {
+		keys = keys[:n]
+	}
+	for i, p := range keys {
+		keys[i] = b.reasons[p]
+	}
+	return keys
 }
 
 // destructive reports whether an action removes or replaces local content or
@@ -558,15 +692,14 @@ func (e *Engine) execute(ctx context.Context, path string, d reconcile.Decision,
 // publishLocal seals the local file, uploads the ciphertext, and publishes an
 // event carrying the plaintext identity plus the sealed-blob address.
 func (e *Engine) publishLocal(ctx context.Context, local *tree.Entry) error {
-	abs := e.abs(local.Path)
-	info, err := os.Stat(abs)
+	info, err := e.fs.Lstat(local.Path)
 	if err != nil {
 		return fmt.Errorf("read: %w", err)
 	}
 	if info.Size() > e.chunkSize {
-		return e.publishLocalChunked(ctx, local, abs)
+		return e.publishLocalChunked(ctx, local)
 	}
-	plaintext, err := os.ReadFile(abs)
+	plaintext, err := e.fs.ReadFile(local.Path)
 	if err != nil {
 		return fmt.Errorf("read: %w", err)
 	}
@@ -612,8 +745,8 @@ const ChunkSize = 16 << 20
 
 // publishLocalChunked seals and uploads the file one ChunkSize span at a time,
 // publishing the ordered chunk addresses rather than a single blob address.
-func (e *Engine) publishLocalChunked(ctx context.Context, local *tree.Entry, abs string) error {
-	f, err := os.Open(abs)
+func (e *Engine) publishLocalChunked(ctx context.Context, local *tree.Entry) error {
+	f, err := e.fs.Open(local.Path)
 	if err != nil {
 		return fmt.Errorf("read: %w", err)
 	}
@@ -666,20 +799,11 @@ func (e *Engine) publishLocalChunked(ctx context.Context, local *tree.Entry, abs
 // and checked before anything is put in place: a truncated or reordered chunk
 // list fails the check and the temp file is discarded.
 func (e *Engine) writeRemoteChunked(ctx context.Context, path string, remote *tree.Entry, conflictCopy bool) error {
-	abs := e.abs(path)
-	dir := filepath.Dir(abs)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("write: %w", err)
-	}
-	tmp, err := os.CreateTemp(dir, scan.TempPrefix+"*")
+	tmp, err := e.fs.Create(path)
 	if err != nil {
 		return fmt.Errorf("write: %w", err)
 	}
-	tmpName := tmp.Name()
-	defer func() {
-		tmp.Close()
-		os.Remove(tmpName) // no-op once the rename below has succeeded
-	}()
+	defer tmp.Abort()
 
 	sum := sha256.New()
 	for i, c := range remote.Chunks {
@@ -703,20 +827,12 @@ func (e *Engine) writeRemoteChunked(ctx context.Context, path string, remote *tr
 	if got := hex.EncodeToString(sum.Sum(nil)); got != remote.Sha256 {
 		return fmt.Errorf("decrypted content %s does not match expected %s", got, remote.Sha256)
 	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("write: %w", err)
-	}
-	if !remote.ModTime.IsZero() {
-		if err := os.Chtimes(tmpName, time.Now(), remote.ModTime); err != nil {
-			return fmt.Errorf("write: %w", err)
-		}
-	}
 	if conflictCopy {
 		if err := e.preserveConflictCopy(path); err != nil {
 			return fmt.Errorf("preserve conflict copy: %w", err)
 		}
 	}
-	if err := os.Rename(tmpName, abs); err != nil {
+	if err := tmp.Commit(remote.ModTime); err != nil {
 		return fmt.Errorf("write: %w", err)
 	}
 	return e.idx.Put(remote)
@@ -775,13 +891,12 @@ func (e *Engine) writeRemote(ctx context.Context, path string, remote *tree.Entr
 		return fmt.Errorf("decrypted content %s does not match expected %s", got, remote.Sha256)
 	}
 
-	abs := e.abs(path)
 	if conflictCopy {
 		if err := e.preserveConflictCopy(path); err != nil {
 			return fmt.Errorf("preserve conflict copy: %w", err)
 		}
 	}
-	if err := atomicWrite(abs, plaintext, remote.ModTime); err != nil {
+	if err := e.fs.WriteFile(path, plaintext, remote.ModTime); err != nil {
 		return fmt.Errorf("write: %w", err)
 	}
 	return e.idx.Put(remote)
@@ -895,39 +1010,23 @@ func supersedes(a, b *nostr.Event) bool {
 // sibling that will itself sync on the next pass, so the owner sees the losing
 // version on every device and resolves it with a rename.
 func (e *Engine) preserveConflictCopy(path string) error {
-	src := e.abs(path)
-	data, err := os.ReadFile(src)
+	data, err := e.fs.ReadFile(path)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			return nil // nothing local to preserve
 		}
 		return err
 	}
-	dst := e.abs(conflictCopyPath(path, e.id.PublicHex()))
-	return atomicWrite(dst, data, time.Now())
+	return e.fs.WriteFile(conflictCopyPath(path, e.id.PublicHex()), data, time.Now())
 }
 
 // moveToTrash relocates a file under the sync root's trash directory, preserving
 // its relative structure; a name clash is disambiguated with a timestamp.
-func (e *Engine) moveToTrash(path string) error {
-	src := e.abs(path)
-	dst := filepath.Join(e.root, scan.TrashDir, filepath.FromSlash(path))
-	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
-		return err
-	}
-	if _, err := os.Stat(dst); err == nil {
-		dst = fmt.Sprintf("%s.%d", dst, time.Now().UnixNano())
-	}
-	return os.Rename(src, dst)
-}
-
-func (e *Engine) abs(relSlash string) string {
-	return filepath.Join(e.root, filepath.FromSlash(relSlash))
-}
+func (e *Engine) moveToTrash(path string) error { return e.fs.Trash(path) }
 
 // loadIgnore reads the sync root's .tendrilsignore into a matcher.
 func (e *Engine) loadIgnore() (*ignore.Matcher, error) {
-	return IgnoreMatcher(e.root, e.exclude)
+	return IgnoreMatcher(e.fs, e.exclude)
 }
 
 // IgnoreMatcher compiles the effective ignore rules for a node: the synced
@@ -937,9 +1036,9 @@ func (e *Engine) loadIgnore() (*ignore.Matcher, error) {
 // exists but cannot be read is an error, never an empty rule set. Both the
 // engine and the daemonless status command call this, so the two cannot
 // disagree about which paths this node is responsible for.
-func IgnoreMatcher(root string, local []string) (*ignore.Matcher, error) {
+func IgnoreMatcher(fsys *rootfs.FS, local []string) (*ignore.Matcher, error) {
 	var lines []string
-	data, err := os.ReadFile(filepath.Join(root, ignore.FileName))
+	data, err := fsys.ReadFile(ignore.FileName)
 	switch {
 	case err == nil:
 		lines = strings.Split(string(data), "\n")
@@ -982,42 +1081,12 @@ func unionPaths(maps ...map[string]*tree.Entry) []string {
 
 // conflictCopyPath inserts the conflict marker (plus a short device tag, so
 // copies from two devices do not collide) before a path's extension.
-func conflictCopyPath(path, pubkey string) string {
+func conflictCopyPath(p, pubkey string) string {
 	tag := pubkey
 	if len(tag) > 8 {
 		tag = tag[:8]
 	}
-	ext := filepath.Ext(path)
-	stem := strings.TrimSuffix(path, ext)
+	ext := path.Ext(p)
+	stem := strings.TrimSuffix(p, ext)
 	return stem + scan.ConflictMarker + tag + ext
-}
-
-// atomicWrite writes data to abs via a temp file in the same directory followed
-// by a rename, so a reader never sees a half-written file, and stamps the file's
-// mtime to match the source of truth.
-func atomicWrite(abs string, data []byte, mtime time.Time) error {
-	dir := filepath.Dir(abs)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(dir, scan.TempPrefix+"*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // no-op after a successful rename
-
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if !mtime.IsZero() {
-		if err := os.Chtimes(tmpName, time.Now(), mtime); err != nil {
-			return err
-		}
-	}
-	return os.Rename(tmpName, abs)
 }

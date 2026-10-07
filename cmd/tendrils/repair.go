@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/spf13/cobra"
 
@@ -15,6 +14,7 @@ import (
 	"ca.punkscience.tendrils/internal/crypt"
 	"ca.punkscience.tendrils/internal/engine"
 	"ca.punkscience.tendrils/internal/relay"
+	"ca.punkscience.tendrils/internal/rootfs"
 	"ca.punkscience.tendrils/internal/tree"
 )
 
@@ -159,8 +159,12 @@ func newRepairCmd() *cobra.Command {
 // repairOne restores the blob for one entry from the local file, refusing unless
 // the local copy reproduces exactly the bytes the event names.
 func repairOne(ctx context.Context, root string, e *tree.Entry, symKey [32]byte, blobs *blob.Client, apply bool) (string, error) {
-	abs := filepath.Join(root, filepath.FromSlash(e.Path))
-	plaintext, err := os.ReadFile(abs)
+	fsys, err := rootfs.Open(root)
+	if err != nil {
+		return "", err
+	}
+	defer fsys.Close()
+	plaintext, err := fsys.ReadFile(e.Path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return "", fmt.Errorf("not on this device")

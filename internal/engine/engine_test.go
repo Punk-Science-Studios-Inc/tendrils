@@ -14,6 +14,7 @@ import (
 	"ca.punkscience.tendrils/internal/index"
 	"ca.punkscience.tendrils/internal/keys"
 	"ca.punkscience.tendrils/internal/nostrevent"
+	"ca.punkscience.tendrils/internal/rootfs"
 	"ca.punkscience.tendrils/internal/rootid"
 	"ca.punkscience.tendrils/internal/scan"
 	"ca.punkscience.tendrils/internal/tree"
@@ -108,6 +109,21 @@ func newEngine(t *testing.T, root string, id *keys.Identity, ev EventStore, bl B
 		t.Fatalf("new engine: %v", err)
 	}
 	return eng
+}
+
+// openPass opens the engine's root as a Sync pass would, for tests that drive a
+// single action directly.
+func openPass(t *testing.T, e *Engine) {
+	t.Helper()
+	fsys, err := rootfs.OpenVerified(e.root, e.rootID)
+	if err != nil {
+		t.Fatalf("open root: %v", err)
+	}
+	e.fs = fsys
+	t.Cleanup(func() {
+		fsys.Close()
+		e.fs = nil
+	})
 }
 
 func writeFile(t *testing.T, root, rel, content string, mtime time.Time) {
@@ -409,6 +425,7 @@ func TestPublishUsesHashOfUploadedBytes(t *testing.T) {
 		Size:    int64(len("bytes as first scanned")),
 		ModTime: time.Unix(1_700_000_200, 0),
 	}
+	openPass(t, engA)
 	if err := engA.publishLocal(context.Background(), stale); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
@@ -841,7 +858,12 @@ func TestLocalExcludeCanReincludeSharedIgnore(t *testing.T) {
 
 // A missing .tendrilsignore is not an error: local patterns still apply.
 func TestIgnoreMatcherWithoutSharedFile(t *testing.T) {
-	m, err := IgnoreMatcher(t.TempDir(), []string{"music/"})
+	fsys, err := rootfs.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fsys.Close()
+	m, err := IgnoreMatcher(fsys, []string{"music/"})
 	if err != nil {
 		t.Fatal(err)
 	}

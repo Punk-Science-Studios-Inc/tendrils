@@ -340,16 +340,22 @@ func TestRootLostMidPassStopsDestructiveWork(t *testing.T) {
 		}
 	}
 	pulled := false
+	want := rootid.ErrRootMissing
 	eng.OnProgress(func(p Progress) {
 		if p.Path != "" && !pulled {
 			pulled = true
 			if err := os.Rename(root, root+".away"); err != nil {
-				t.Fatal(err)
+				// Windows will not rename a directory the pass holds open, so
+				// lose the marker instead: the folder stops proving it is the root.
+				want = rootid.ErrNoMarker
+				if err := os.Remove(filepath.Join(root, rootid.MarkerName)); err != nil {
+					t.Fatal(err)
+				}
 			}
 		}
 	})
 
-	assertPaused(t, eng.Sync(context.Background()), stats, rootid.ErrRootMissing)
+	assertPaused(t, eng.Sync(context.Background()), stats, want)
 	if got := tombstones(t, ev); len(got) != 1 {
 		t.Fatalf("tombstones = %v, want only the one already under way", got)
 	}

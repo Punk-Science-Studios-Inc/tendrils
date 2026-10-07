@@ -34,6 +34,9 @@ type statusSnapshot struct {
 	// Unavailable counts paths the last scan could not observe; they are neither
 	// synced nor deleted until it can.
 	Unavailable int `json:"unavailable"`
+	// Blocked counts paths this device cannot sync — invalid names, names the
+	// platform cannot represent, case collisions. Left untouched here.
+	Blocked int `json:"blocked"`
 	// Paused says why the daemon is doing no work at all, e.g. the sync root is
 	// missing or is not the enrolled folder.
 	Paused  string `json:"paused,omitempty"`
@@ -130,6 +133,7 @@ func (srv *statusServer) handler(w http.ResponseWriter, _ *http.Request) {
 		Conflicts:     stats.Conflicts,
 		Deferred:      stats.Deferred,
 		Unavailable:   stats.Unavailable,
+		Blocked:       stats.Blocked,
 		Paused:        stats.Paused,
 		Syncing:       syncing,
 		Done:          prog.Done,

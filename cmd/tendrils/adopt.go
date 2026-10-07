@@ -4,14 +4,15 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/spf13/cobra"
 
 	"ca.punkscience.tendrils/internal/config"
 	"ca.punkscience.tendrils/internal/engine"
 	"ca.punkscience.tendrils/internal/index"
+	"ca.punkscience.tendrils/internal/rootfs"
 	"ca.punkscience.tendrils/internal/rootid"
+	"ca.punkscience.tendrils/internal/syncpath"
 )
 
 func newAdoptCmd() *cobra.Command {
@@ -112,7 +113,12 @@ func surveyRoot(root string, idx *index.Store, exclude []string) (present, live 
 	if err != nil {
 		return 0, 0, err
 	}
-	ign, err := engine.IgnoreMatcher(root, exclude)
+	fsys, err := rootfs.Open(root)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer fsys.Close()
+	ign, err := engine.IgnoreMatcher(fsys, exclude)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -121,10 +127,11 @@ func surveyRoot(root string, idx *index.Store, exclude []string) (present, live 
 			continue
 		}
 		live++
-		info, err := os.Lstat(filepath.Join(root, filepath.FromSlash(path)))
+		info, err := fsys.Lstat(path)
 		switch {
 		case err == nil && info.Mode().IsRegular():
 			present++
+		case errors.Is(err, syncpath.ErrInvalid), errors.Is(err, syncpath.ErrBlocked), errors.Is(err, rootfs.ErrNotConfined):
 		case err != nil && !errors.Is(err, os.ErrNotExist):
 			return 0, 0, err
 		}

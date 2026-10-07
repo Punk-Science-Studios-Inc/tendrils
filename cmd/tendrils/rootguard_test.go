@@ -184,3 +184,19 @@ func TestStatusReportsPausedRoot(t *testing.T) {
 		t.Errorf("status counted an unverified folder's missing files as pending:\n%s", out)
 	}
 }
+
+// A synced path behind a folder that is now a link out of the root is skipped
+// by the survey, not an error that stops adoption even with --force.
+func TestAdoptSkipsPathsBehindAnEscapingLink(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	touch(t, outside, "b.md")
+	touch(t, root, "a.md")
+	if err := os.Symlink(outside, filepath.Join(root, "notes")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	legacyEnrollment(t, root, "a.md", "notes/b.md")
+	if _, err := runCLI(t, "adopt", "--force"); err != nil {
+		t.Fatalf("adopt --force: %v", err)
+	}
+}
